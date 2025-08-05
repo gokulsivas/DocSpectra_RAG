@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+boto3
+pinecone
+marker-pdf>=1.8.2
+pdfplumber
+tiktoken
+python-dotenv
+requests
