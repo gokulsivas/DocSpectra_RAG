@@ -49,7 +49,7 @@ class S3ModelManager:
     def _download_model_from_s3(self, model_name: str) -> str:
         """Download model from S3 to local cache"""
         local_model_path = os.path.join(self.cache_dir, model_name)
-        s3_prefix = f"models/{model_name}/"
+        s3_prefix = f"marker_models/{model_name}/"
         
         if model_name in self._downloaded_models:
             logger.info(f"Model {model_name} already cached locally")
@@ -146,10 +146,148 @@ class S3ModelManager:
             shutil.rmtree(self.cache_dir)
             logger.info(f"Cleaned up model cache directory: {self.cache_dir}")
 
+class BedrockClient:
+    """Bedrock client for Titan model integration"""
+    
+    def __init__(self, region: str = 'us-east-1'):
+        self.region = region
+        self._bedrock_client = None
+        
+        # Titan model configurations
+        self.titan_model_id = os.getenv('TITAN_MODEL_ID', 'amazon.titan-text-express-v1')
+        self.max_tokens = int(os.getenv('MAX_TOKENS', '300'))
+        self.temperature = float(os.getenv('TEMPERATURE', '0.7'))
+        self.top_p = float(os.getenv('TOP_P', '0.9'))
+        
+        logger.info(f"Initialized BedrockClient with model: {self.titan_model_id}")
+    
+    @property
+    def bedrock_client(self):
+        """Lazy-loaded Bedrock runtime client"""
+        if self._bedrock_client is None:
+            self._bedrock_client = boto3.client(
+                'bedrock-runtime',
+                region_name=self.region
+            )
+            logger.info("Bedrock runtime client initialized")
+        return self._bedrock_client
+    
+    def generate_answer(self, question: str, context: str) -> str:
+        """Generate answer using Bedrock Titan model"""
+        try:
+            # Build enhanced prompt
+            prompt = self._build_prompt(question, context)
+            
+            # Prepare request body
+            body = {
+                "inputText": prompt,
+                "textGenerationConfig": {
+                    "temperature": self.temperature,
+                    "maxTokenCount": self.max_tokens,
+                    "topP": self.top_p,
+                    "stopSequences": ["Human:", "Context:", "Question:", "\n\n---"]
+                }
+            }
+            
+            # Invoke Bedrock model
+            response = self.bedrock_client.invoke_model(
+                modelId=self.titan_model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body).encode("utf-8")
+            )
+            
+            # Parse response
+            result = json.loads(response['body'].read().decode())
+            
+            if "results" not in result or len(result["results"]) == 0:
+                logger.warning("Invalid response format from Bedrock")
+                return "Unable to generate answer due to invalid model response."
+            
+            answer = result["results"][0]["outputText"].strip()
+            
+            # Clean up the answer
+            answer = self._clean_answer(answer)
+            
+            logger.info(f"Generated answer using Bedrock Titan: {len(answer)} characters")
+            return answer
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            logger.error(f"Bedrock API error [{error_code}]: {error_message}")
+            
+            if error_code == 'ValidationException':
+                return f"Invalid request to language model: {error_message}"
+            elif error_code == 'ResourceNotFoundException':
+                return f"Language model {self.titan_model_id} not available in region {self.region}"
+            elif error_code == 'AccessDeniedException':
+                return "Access denied to language model. Please check your AWS permissions."
+            elif error_code == 'ThrottlingException':
+                return "Language model is currently busy. Please try again later."
+            else:
+                return f"Language model error: {error_message}"
+                
+        except Exception as e:
+            logger.error(f"Unexpected error generating answer: {e}")
+            return f"Unable to generate answer due to technical issue: {str(e)}"
+    
+    def _build_prompt(self, question: str, context: str) -> str:
+        """Build enhanced prompt for better answer generation"""
+        return f"""You are an AI assistant that answers questions based on provided document context. 
+
+Instructions:
+- Answer the question directly and concisely based ONLY on the provided context
+- If the answer is not in the context, clearly state that the information is not available
+- Be accurate and avoid speculation or information not in the context
+- Keep your answer focused and relevant to the question
+- Use clear, professional language
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+    
+    def _clean_answer(self, answer: str) -> str:
+        """Clean and format the generated answer"""
+        # Remove common artifacts
+        answer = answer.replace("Answer:", "").strip()
+        answer = answer.replace("Based on the context", "").strip()
+        answer = answer.replace("According to the document", "").strip()
+        
+        # Remove incomplete sentences at the end
+        sentences = answer.split('.')
+        if len(sentences) > 1 and len(sentences[-1].strip()) < 10:
+            answer = '.'.join(sentences[:-1]) + '.'
+        
+        # Ensure proper capitalization
+        if answer and not answer[0].isupper():
+            answer = answer[0].upper() + answer[1:]
+        
+        # Limit length
+        if len(answer) > 800:
+            answer = answer[:797] + "..."
+        
+        return answer
+    
+    def test_connection(self) -> bool:
+        """Test Bedrock connection"""
+        try:
+            test_question = "What is this?"
+            test_context = "This is a test document."
+            result = self.generate_answer(test_question, test_context)
+            logger.info(f"Bedrock connection test successful: {result[:50]}...")
+            return True
+        except Exception as e:
+            logger.error(f"Bedrock connection test failed: {e}")
+            return False
+
 class MarkerHandlerWithS3Models:
     """
     Marker handler that loads models from S3 and processes documents from URLs only.
-    No S3 document processing - only model loading from S3.
+    Enhanced with Bedrock Titan integration for intelligent answer generation.
     """
     
     def __init__(self, 
@@ -157,9 +295,10 @@ class MarkerHandlerWithS3Models:
                  aws_region: str = "us-east-1",
                  use_llm: bool = False,
                  batch_multiplier: int = 1,
-                 download_timeout: int = 300):
+                 download_timeout: int = 300,
+                 use_bedrock_qa: bool = True):
         """
-        Initialize handler with S3 models.
+        Initialize handler with S3 models and Bedrock integration.
         
         Args:
             model_bucket: S3 bucket containing Marker models (NOT documents)
@@ -167,15 +306,28 @@ class MarkerHandlerWithS3Models:
             use_llm: Whether to use LLM for enhanced accuracy
             batch_multiplier: Batch size multiplier for processing
             download_timeout: URL download timeout in seconds
+            use_bedrock_qa: Whether to use Bedrock for Q&A (vs keyword matching)
         """
         self.model_bucket = model_bucket
         self.aws_region = aws_region
         self.use_llm = use_llm
         self.batch_multiplier = batch_multiplier
         self.download_timeout = download_timeout
+        self.use_bedrock_qa = use_bedrock_qa
         
         # Initialize S3 model manager
         self.model_manager = S3ModelManager(model_bucket, aws_region)
+        
+        # Initialize Bedrock client if Q&A is enabled
+        self.bedrock_client = None
+        if self.use_bedrock_qa:
+            try:
+                self.bedrock_client = BedrockClient(aws_region)
+                logger.info("Bedrock Q&A integration enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Bedrock client: {e}")
+                logger.warning("Falling back to keyword-based Q&A")
+                self.use_bedrock_qa = False
         
         # Marker components (loaded on demand)
         self._model_dict = None
@@ -189,6 +341,7 @@ class MarkerHandlerWithS3Models:
         
         logger.info(f"Initialized MarkerHandlerWithS3Models")
         logger.info(f"Model bucket: {model_bucket}")
+        logger.info(f"Bedrock Q&A: {'Enabled' if self.use_bedrock_qa else 'Disabled'}")
         logger.info(f"Document processing: URLs only (no S3 documents)")
 
     def _setup_marker_environment(self):
@@ -382,17 +535,17 @@ class MarkerHandlerWithS3Models:
             }
 
     def _generate_answers(self, document_text: str, questions: List[str]) -> List[Dict[str, str]]:
-        """Generate answers using improved keyword matching"""
+        """Generate answers using Bedrock integration or keyword matching fallback"""
         qa_results = []
         sentences = [s.strip() for s in document_text.split('.') if s.strip()]
         
         for question in questions:
             try:
-                answer = self._find_answer_in_text(question, sentences)
+                answer = self._find_answer_in_text(question, sentences, document_text)
                 qa_results.append({
                     'question': question,
                     'answer': answer,
-                    'method': 'keyword_matching'
+                    'method': 'bedrock_titan' if self.use_bedrock_qa else 'keyword_matching'
                 })
             except Exception as e:
                 logger.warning(f"Error answering '{question}': {str(e)}")
@@ -404,8 +557,13 @@ class MarkerHandlerWithS3Models:
         
         return qa_results
 
-    def _find_answer_in_text(self, question: str, sentences: List[str], context_window: int = 2) -> str:
-        """Find answer using enhanced keyword matching"""
+    def _find_answer_in_text(self, question: str, sentences: List[str], full_document_text: str, context_window: int = 3) -> str:
+        """
+        Enhanced answer finding with Bedrock Titan integration.
+        
+        First finds relevant context using keyword matching, then uses Bedrock Titan 
+        to generate a proper answer based on that context.
+        """
         question_lower = question.lower()
         
         # Remove stop words and extract meaningful keywords
@@ -423,6 +581,8 @@ class MarkerHandlerWithS3Models:
         if not keywords:
             return "Question too vague to extract meaningful keywords."
         
+        logger.info(f"Extracted keywords for '{question}': {keywords}")
+        
         # Score sentences based on keyword matches
         sentence_scores = []
         for i, sentence in enumerate(sentences):
@@ -435,7 +595,7 @@ class MarkerHandlerWithS3Models:
             phrase_bonus = 2 if any(kw in sentence_lower for kw in keywords if len(kw) > 4) else 0
             
             # Length preference (not too short, not too long)
-            length_score = 1 if 20 <= len(sentence) <= 200 else 0.5
+            length_score = 1 if 20 <= len(sentence) <= 300 else 0.5
             
             total_score = keyword_score + phrase_bonus + length_score
             
@@ -445,11 +605,50 @@ class MarkerHandlerWithS3Models:
         if not sentence_scores:
             return "No relevant information found for this question."
         
-        # Get best match with context
+        # Get best matches and create context
         sentence_scores.sort(reverse=True, key=lambda x: x[0])
+        
+        # Take top scoring sentences to build context
+        top_sentences = sentence_scores[:5]  # Top 5 relevant sentences
+        context_parts = []
+        
+        for score, sentence_idx, sentence in top_sentences:
+            # Add context window around each relevant sentence
+            start_idx = max(0, sentence_idx - context_window)
+            end_idx = min(len(sentences), sentence_idx + context_window + 1)
+            
+            context_sentences = sentences[start_idx:end_idx]
+            context_part = '. '.join(context_sentences).strip()
+            
+            if context_part not in context_parts:  # Avoid duplicates
+                context_parts.append(context_part)
+        
+        # Combine all context parts
+        combined_context = '\n\n---\n\n'.join(context_parts)
+        
+        # Limit context length to avoid token limits
+        max_context_length = 4000  # Adjust based on your model's limits
+        if len(combined_context) > max_context_length:
+            combined_context = combined_context[:max_context_length] + "\n\n[Context truncated...]"
+        
+        logger.info(f"Built context of {len(combined_context)} characters from {len(context_parts)} parts")
+        
+        # Use Bedrock Titan for answer generation if available
+        if self.use_bedrock_qa and self.bedrock_client:
+            try:
+                answer = self.bedrock_client.generate_answer(question, combined_context)
+                logger.info("Generated answer using Bedrock Titan")
+                return answer
+            except Exception as e:
+                logger.warning(f"Bedrock answer generation failed: {e}")
+                logger.info("Falling back to keyword-based answer")
+                # Fall through to keyword-based approach
+        
+        # Fallback: keyword-based answer (original logic)
+        logger.info("Using keyword-based answer generation")
         best_score, best_index, best_sentence = sentence_scores[0]
         
-        # Extract context window
+        # Extract context window around best match
         start_idx = max(0, best_index - context_window)
         end_idx = min(len(sentences), best_index + context_window + 1)
         
@@ -481,9 +680,17 @@ class MarkerHandlerWithS3Models:
         return results
 
     def health_check(self) -> Dict[str, Any]:
-        """Check system health"""
+        """Check system health including Bedrock integration"""
         # Check S3 model availability
         available_models = self.model_manager.list_available_models()
+        
+        # Check Bedrock connection if enabled
+        bedrock_status = False
+        if self.use_bedrock_qa and self.bedrock_client:
+            try:
+                bedrock_status = self.bedrock_client.test_connection()
+            except Exception as e:
+                logger.warning(f"Bedrock health check failed: {e}")
         
         return {
             'status': 'healthy',
@@ -492,7 +699,10 @@ class MarkerHandlerWithS3Models:
             'available_models': available_models,
             'gpu_available': self._has_gpu(),
             'temp_files_count': len(self._temp_files),
-            'document_cache_dir': self.document_cache_dir
+            'document_cache_dir': self.document_cache_dir,
+            'bedrock_qa_enabled': self.use_bedrock_qa,
+            'bedrock_connection': bedrock_status,
+            'bedrock_model': getattr(self.bedrock_client, 'titan_model_id', 'N/A') if self.bedrock_client else 'N/A'
         }
 
     def cleanup(self):
@@ -523,4 +733,25 @@ class MarkerHandlerWithS3Models:
         
         logger.info("Cleanup completed")
 
-
+# Context manager for easy usage
+class MarkerS3Context:
+    """Context manager for Marker with S3 models and Bedrock integration"""
+    
+    def __init__(self, bucket_name: str, use_bedrock_qa: bool = True):
+        self.handler = MarkerHandlerWithS3Models(
+            model_bucket=bucket_name,
+            aws_region=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'),
+            use_llm=False,  # Set to True for enhanced PDF processing accuracy
+            batch_multiplier=1,
+            use_bedrock_qa=use_bedrock_qa
+        )
+    
+    def __enter__(self):
+        return self.handler
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.handler.cleanup()
+    
+    def process_document_from_url(self, document_url: str, **kwargs):
+        """Wrapper method for DocumentProcessor integration"""
+        return self.handler.process_document_from_url(document_url, **kwargs)
