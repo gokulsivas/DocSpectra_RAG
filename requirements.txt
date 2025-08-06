@@ -2,7 +2,7 @@ fastapi
 uvicorn
 boto3
 pinecone
-marker-pdf>=1.8.2
+marker-pdf
 pdfplumber
 tiktoken
 python-dotenv
