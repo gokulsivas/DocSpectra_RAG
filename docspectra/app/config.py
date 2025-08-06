@@ -1,4 +1,4 @@
-# app/config.py
+# app/config.py - UPDATED to ensure processing_config is properly accessible
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -22,13 +22,17 @@ class PineconeConfig:
 @dataclass
 class ProcessingConfig:
     """Processing configuration"""
-    chunk_max_words: int = 150
-    max_tokens: int = 300
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k_retrieval: int = 5
+    chunk_max_words: int = int(os.getenv('CHUNK_MAX_WORDS', '150'))
+    max_tokens: int = int(os.getenv('MAX_TOKENS', '300'))
+    temperature: float = float(os.getenv('TEMPERATURE', '0.7'))
+    top_p: float = float(os.getenv('TOP_P', '0.9'))
+    top_k_retrieval: int = int(os.getenv('TOP_K_RETRIEVAL', '5'))
 
-# Global config instances
+# Global config instances - MAKE SURE these are created
 aws_config = AWSConfig()
 pinecone_config = PineconeConfig()
 processing_config = ProcessingConfig()
+
+# Add validation to ensure critical configs are set
+if not pinecone_config.api_key:
+    raise ValueError("PINECONE_API_KEY environment variable is required")

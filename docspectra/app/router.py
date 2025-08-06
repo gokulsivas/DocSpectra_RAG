@@ -67,13 +67,20 @@ async def process_query(req: QueryRequest) -> Dict[str, Any]:
 async def health_check():
     """Check system health"""
     try:
-        health = processor.vector_store.pc.list_indexes()
+        # Check vector store health
+        vector_health = processor.vector_store.health_check()
+        
+        # Check if processor is initialized
+        processor_status = "initialized" if processor else "not_initialized"
+        
         return {
-            "status": "healthy",
-            "pinecone": "connected",
-            "s3_models": "cached"
+            "status": "healthy" if vector_health["status"] in ["healthy", "index_missing"] else "unhealthy",
+            "processor": processor_status,
+            "vector_store": vector_health,
+            "pinecone": "connected" if vector_health["pinecone_connected"] else "disconnected"
         }
     except Exception as e:
+        logger.error(f"Health check failed: {e}")
         return {
             "status": "unhealthy", 
             "error": str(e)
