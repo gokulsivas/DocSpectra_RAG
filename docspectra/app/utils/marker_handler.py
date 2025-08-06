@@ -4,22 +4,26 @@ import logging
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 import boto3
 from botocore.exceptions import ClientError
 import threading
 from functools import lru_cache
 import requests
-import sys
 from urllib.parse import urlparse
-import mimetypes
+
+# Modern Marker imports
+from marker.converters.pdf import PdfConverter
+from marker.models import create_model_dict
+from marker.output import text_from_rendered
+from marker.config.parser import ConfigParser
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class S3ModelCache:
-    """S3 model cache with temporary local storage"""
+class S3ModelManager:
+    """Manages downloading and caching models from S3 for Marker"""
     
     def __init__(self, bucket_name: str, region: str = 'us-east-1'):
         self.bucket_name = bucket_name
@@ -28,10 +32,19 @@ class S3ModelCache:
         self._cache_lock = threading.Lock()
         self._downloaded_models = set()
         
-        # Initialize S3 client with IAM role (no explicit credentials needed)
+        # Initialize S3 client (using IAM role, no explicit credentials needed)
         self.s3_client = boto3.client('s3', region_name=region)
         
-        logger.info(f"Initialized S3ModelCache with temp dir: {self.cache_dir}")
+        # Model mappings that Marker expects
+        self.model_mappings = {
+            'layout_detection': 'LAYOUT_MODEL_CHECKPOINT',
+            'text_detection': 'DETECTOR_MODEL_CHECKPOINT', 
+            'text_recognition': 'RECOGNITION_MODEL_CHECKPOINT',
+            'table_recognition': 'TABLE_REC_MODEL_CHECKPOINT',
+            'texify': 'TEXIFY_MODEL_CHECKPOINT'
+        }
+        
+        logger.info(f"Initialized S3ModelManager with temp dir: {self.cache_dir}")
     
     def _download_model_from_s3(self, model_name: str) -> str:
         """Download model from S3 to local cache"""
@@ -81,57 +94,163 @@ class S3ModelCache:
         except ClientError as e:
             logger.error(f"Error downloading {model_name}: {str(e)}")
             raise
-        except Exception as e:
-            logger.error(f"Unexpected error downloading {model_name}: {str(e)}")
-            raise
     
-    def get_model_path(self, model_name: str) -> str:
-        """Get local path for model, downloading if necessary"""
-        with self._cache_lock:
-            return self._download_model_from_s3(model_name)
+    def setup_model_environment(self, models_to_load: Optional[List[str]] = None):
+        """Setup environment variables pointing to cached model paths"""
+        if models_to_load is None:
+            models_to_load = list(self.model_mappings.keys())
+        
+        for model_name in models_to_load:
+            if model_name not in self.model_mappings:
+                logger.warning(f"Unknown model: {model_name}")
+                continue
+            
+            try:
+                # Download model and get local path
+                local_path = self._download_model_from_s3(model_name)
+                
+                # Set environment variable for marker
+                env_var = self.model_mappings[model_name]
+                os.environ[env_var] = local_path
+                
+                logger.info(f"Set {env_var} = {local_path}")
+                
+            except Exception as e:
+                logger.error(f"Failed to setup {model_name}: {str(e)}")
+                raise
+        
+        # Set cache directory for additional models
+        os.environ['MODEL_CACHE_DIR'] = self.cache_dir
+        logger.info(f"Set MODEL_CACHE_DIR = {self.cache_dir}")
+    
+    def list_available_models(self) -> Dict[str, bool]:
+        """Check which models are available in S3"""
+        available = {}
+        
+        for model_name in self.model_mappings.keys():
+            try:
+                response = self.s3_client.list_objects_v2(
+                    Bucket=self.bucket_name,
+                    Prefix=f"models/{model_name}/",
+                    MaxKeys=1
+                )
+                available[model_name] = 'Contents' in response
+            except Exception:
+                available[model_name] = False
+        
+        return available
     
     def cleanup(self):
         """Clean up temporary cache directory"""
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
-            logger.info(f"Cleaned up cache directory: {self.cache_dir}")
+            logger.info(f"Cleaned up model cache directory: {self.cache_dir}")
 
-class OptimizedMarkerHandler:
-    """Enhanced marker handler using S3-stored models"""
+class MarkerHandlerWithS3Models:
+    """
+    Marker handler that loads models from S3 and processes documents from URLs only.
+    No S3 document processing - only model loading from S3.
+    """
     
-    def __init__(self, bucket_name: str, region: str = 'us-east-1'):
-        self.bucket_name = bucket_name
-        self.region = region
-        self.model_cache = S3ModelCache(bucket_name, region)
-        
-        # Model path mappings for marker
-        self.model_mappings = {
-            'layout_detection': 'LAYOUT_MODEL_CHECKPOINT',
-            'text_detection': 'DETECTOR_MODEL_CHECKPOINT', 
-            'text_recognition': 'RECOGNITION_MODEL_CHECKPOINT',
-            'table_recognition': 'TABLE_REC_MODEL_CHECKPOINT',
-            'texify': 'TEXIFY_MODEL_CHECKPOINT'
-        }
-        
-        # Document cache for temporary files
-        self.document_cache_dir = tempfile.mkdtemp(prefix='marker_documents_')
-        
-        logger.info("Initialized OptimizedMarkerHandler")
-    
-    def _download_document_from_url(self, url: str, timeout: int = 300) -> str:
-        """Download document from remote URL to temporary local file
+    def __init__(self, 
+                 model_bucket: str,
+                 aws_region: str = "us-east-1",
+                 use_llm: bool = False,
+                 batch_multiplier: int = 1,
+                 download_timeout: int = 300):
+        """
+        Initialize handler with S3 models.
         
         Args:
-            url: Remote URL of the document
-            timeout: Download timeout in seconds (default: 5 minutes)
-            
-        Returns:
-            Local path to downloaded document
-            
-        Raises:
-            ValueError: If URL is invalid or file type not supported
-            requests.RequestException: If download fails
+            model_bucket: S3 bucket containing Marker models (NOT documents)
+            aws_region: AWS region
+            use_llm: Whether to use LLM for enhanced accuracy
+            batch_multiplier: Batch size multiplier for processing
+            download_timeout: URL download timeout in seconds
         """
+        self.model_bucket = model_bucket
+        self.aws_region = aws_region
+        self.use_llm = use_llm
+        self.batch_multiplier = batch_multiplier
+        self.download_timeout = download_timeout
+        
+        # Initialize S3 model manager
+        self.model_manager = S3ModelManager(model_bucket, aws_region)
+        
+        # Marker components (loaded on demand)
+        self._model_dict = None
+        self._converter = None
+        self._models_loaded = False
+        self._cache_lock = threading.Lock()
+        
+        # Document cache for URL downloads
+        self.document_cache_dir = tempfile.mkdtemp(prefix='marker_documents_')
+        self._temp_files = set()
+        
+        logger.info(f"Initialized MarkerHandlerWithS3Models")
+        logger.info(f"Model bucket: {model_bucket}")
+        logger.info(f"Document processing: URLs only (no S3 documents)")
+
+    def _setup_marker_environment(self):
+        """Setup environment for optimal Marker performance"""
+        # Setup models from S3
+        self.model_manager.setup_model_environment()
+        
+        # Additional Marker configuration
+        os.environ.setdefault("TORCH_DEVICE", "cuda" if self._has_gpu() else "cpu")
+        os.environ.setdefault("OCR_ENGINE", "surya")
+        os.environ.setdefault("EXTRACT_IMAGES", "true")
+        
+        if self.batch_multiplier > 1:
+            os.environ["BATCH_MULTIPLIER"] = str(self.batch_multiplier)
+
+    def _has_gpu(self) -> bool:
+        """Check if GPU is available"""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
+
+    def _ensure_models_loaded(self):
+        """Load Marker models with S3-downloaded model checkpoints"""
+        if not self._models_loaded:
+            with self._cache_lock:
+                if not self._models_loaded:  # Double-check locking
+                    logger.info("Setting up Marker models from S3...")
+                    
+                    # Setup environment with S3 models
+                    self._setup_marker_environment()
+                    
+                    # Create model dictionary with our S3 models
+                    self._model_dict = create_model_dict()
+                    
+                    # Configure Marker
+                    config = {
+                        "output_format": "markdown",
+                        "extract_images": True,
+                    }
+                    
+                    if self.use_llm:
+                        config["use_llm"] = True
+                        config["llm_model"] = "gemini-2.0-flash"
+                    
+                    config_parser = ConfigParser(config)
+                    
+                    # Initialize converter
+                    self._converter = PdfConverter(
+                        config=config_parser.generate_config_dict(),
+                        artifact_dict=self._model_dict,
+                        processor_list=config_parser.get_processors(),
+                        renderer=config_parser.get_renderer(),
+                        llm_service=config_parser.get_llm_service() if self.use_llm else None
+                    )
+                    
+                    self._models_loaded = True
+                    logger.info("Marker models loaded successfully from S3")
+
+    def download_document_from_url(self, url: str) -> str:
+        """Download document from URL to temporary local file"""
         try:
             # Validate URL
             parsed_url = urlparse(url)
@@ -140,25 +259,24 @@ class OptimizedMarkerHandler:
             
             logger.info(f"Downloading document from URL: {url}")
             
-            # Configure session with timeout and headers
+            # Configure session
             session = requests.Session()
             session.headers.update({
-                'User-Agent': 'DocSpectra-RAG/1.0 (Document Processing Bot)',
+                'User-Agent': 'MarkerS3Models/1.0 (Document Processing)',
                 'Accept': 'application/pdf,application/octet-stream,*/*'
             })
             
-            # Download with streaming to handle large files
-            response = session.get(url, timeout=timeout, stream=True)
+            # Download with streaming
+            response = session.get(url, timeout=self.download_timeout, stream=True)
             response.raise_for_status()
             
             # Determine file extension
             content_type = response.headers.get('content-type', '').lower()
-            file_extension = '.pdf'  # Default to PDF
+            file_extension = '.pdf'  # Default
             
             if 'pdf' in content_type:
                 file_extension = '.pdf'
             else:
-                # Try to get extension from URL
                 url_path = parsed_url.path
                 if url_path:
                     _, ext = os.path.splitext(url_path)
@@ -172,154 +290,86 @@ class OptimizedMarkerHandler:
                 delete=False
             )
             
-            # Download file in chunks
+            # Download in chunks
             total_size = int(response.headers.get('content-length', 0))
             downloaded_size = 0
             
-            logger.info(f"Downloading {total_size} bytes to {temp_file.name}")
-            
             with temp_file as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # Filter out keep-alive chunks
+                    if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
                         
-                        # Log progress for large files
                         if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
                             progress = (downloaded_size / total_size) * 100
                             logger.debug(f"Download progress: {progress:.1f}%")
             
-            logger.info(f"Successfully downloaded document to: {temp_file.name}")
-            
-            # Validate file size
+            # Validate file
             file_size = os.path.getsize(temp_file.name)
             if file_size == 0:
                 os.unlink(temp_file.name)
                 raise ValueError("Downloaded file is empty")
             
-            # Basic PDF validation (check PDF header)
+            # Basic PDF validation
             if file_extension == '.pdf':
                 with open(temp_file.name, 'rb') as f:
                     header = f.read(4)
                     if header != b'%PDF':
                         logger.warning("Downloaded file may not be a valid PDF")
             
+            self._temp_files.add(temp_file.name)
+            logger.info(f"Successfully downloaded to: {temp_file.name}")
             return temp_file.name
             
-        except requests.exceptions.Timeout:
-            raise requests.RequestException(f"Download timeout after {timeout} seconds")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error downloading document from {url}: {str(e)}")
-            raise
         except Exception as e:
-            logger.error(f"Unexpected error downloading document: {str(e)}")
+            logger.error(f"Error downloading from {url}: {str(e)}")
             raise
-    
-    def setup_model_environment(self, models_to_load: Optional[list] = None):
-        """Setup environment variables pointing to cached model paths"""
-        if models_to_load is None:
-            models_to_load = list(self.model_mappings.keys())
-        
-        for model_name in models_to_load:
-            if model_name not in self.model_mappings:
-                logger.warning(f"Unknown model: {model_name}")
-                continue
-            
-            try:
-                # Download model and get local path
-                local_path = self.model_cache.get_model_path(model_name)
-                
-                # Set environment variable for marker
-                env_var = self.model_mappings[model_name]
-                os.environ[env_var] = local_path
-                
-                logger.info(f"Set {env_var} = {local_path}")
-                
-            except Exception as e:
-                logger.error(f"Failed to setup {model_name}: {str(e)}")
-                raise
-        
-        # Set cache directory for surya models
-        os.environ['MODEL_CACHE_DIR'] = self.model_cache.cache_dir
-        logger.info(f"Set MODEL_CACHE_DIR = {self.model_cache.cache_dir}")
-    
-    def process_document(self, document_path: str, output_path: str = None) -> Dict[str, Any]:
-        """Process document using marker with S3 models"""
+
+    def convert_pdf_to_markdown(self, pdf_path: str, **kwargs) -> Tuple[str, Dict, List]:
+        """Convert PDF to markdown using S3 models"""
         try:
-            # Ensure models are setup
-            self.setup_model_environment()
+            # Ensure S3 models are loaded
+            self._ensure_models_loaded()
             
-            # Import marker after environment setup
-            from marker.convert import convert_single_pdf
-            from marker.models import load_all_models
+            logger.info(f"Converting PDF: {pdf_path}")
             
-            # Load marker models (they will use our environment variables)
-            model_list = load_all_models()
+            # Convert PDF using Marker with S3 models
+            rendered = self._converter(pdf_path)
+            markdown_text, metadata, images = text_from_rendered(rendered)
             
-            # Convert document
-            logger.info(f"Processing document: {document_path}")
-            
-            full_text, images, out_meta = convert_single_pdf(
-                document_path, 
-                model_list
-            )
-            
-            # Save output if path provided
-            if output_path:
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(full_text)
-                logger.info(f"Saved output to: {output_path}")
-            
-            return {
-                'success': True,
-                'text': full_text,
-                'images': images,
-                'metadata': out_meta,
-                'models_used': list(self.model_mappings.keys())
-            }
+            return markdown_text, metadata, images
             
         except Exception as e:
-            logger.error(f"Error processing document: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
-    
-    def process_document_from_url(self, document_url: str, questions: List[str] = None, output_path: str = None) -> Dict[str, Any]:
-        """Process document from URL and optionally answer questions
-        
-        Args:
-            document_url: Remote URL of the document to process
-            questions: Optional list of questions to answer about the document
-            output_path: Optional path to save processed text
-            
-        Returns:
-            Dict containing processing results and optional answers
-        """
+            logger.error(f"Error converting PDF: {str(e)}")
+            raise
+
+    def process_document_from_url(self, 
+                                document_url: str,
+                                questions: Optional[List[str]] = None,
+                                **kwargs) -> Dict[str, Any]:
+        """Process document from URL using S3 models"""
         temp_document_path = None
         
         try:
-            # Download document from URL
-            temp_document_path = self._download_document_from_url(document_url)
+            # Download document
+            temp_document_path = self.download_document_from_url(document_url)
             
-            # Process the downloaded document
-            processing_result = self.process_document(temp_document_path, output_path)
-            
-            if not processing_result['success']:
-                return processing_result
+            # Convert to markdown
+            markdown_text, metadata, images = self.convert_pdf_to_markdown(
+                temp_document_path, **kwargs
+            )
             
             result = {
                 'success': True,
-                'text': processing_result['text'],
-                'images': processing_result['images'],
-                'metadata': processing_result['metadata'],
-                'models_used': processing_result['models_used'],
+                'text': markdown_text,
+                'images': images,
+                'metadata': metadata,
                 'source_url': document_url
             }
             
-            # If questions provided, generate answers using basic text search
+            # Answer questions if provided
             if questions:
-                result['answers'] = self._generate_answers(processing_result['text'], questions)
+                result['qa_results'] = self._generate_answers(markdown_text, questions)
             
             return result
             
@@ -330,61 +380,76 @@ class OptimizedMarkerHandler:
                 'error': str(e),
                 'source_url': document_url
             }
-        
-        finally:
-            # Cleanup temporary document file
-            if temp_document_path and os.path.exists(temp_document_path):
-                try:
-                    os.unlink(temp_document_path)
-                    logger.debug(f"Cleaned up temporary document: {temp_document_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup temporary file {temp_document_path}: {str(e)}")
-    
-    def _generate_answers(self, document_text: str, questions: List[str]) -> List[str]:
-        """Generate answers to questions based on document text
-        
-        This is a basic implementation using keyword search and context extraction.
-        For production use, consider integrating with a proper Q&A model or RAG system.
-        """
-        answers = []
-        
-        # Split document into sentences for better context extraction
+
+    def _generate_answers(self, document_text: str, questions: List[str]) -> List[Dict[str, str]]:
+        """Generate answers using improved keyword matching"""
+        qa_results = []
         sentences = [s.strip() for s in document_text.split('.') if s.strip()]
         
         for question in questions:
             try:
                 answer = self._find_answer_in_text(question, sentences)
-                answers.append(answer)
+                qa_results.append({
+                    'question': question,
+                    'answer': answer,
+                    'method': 'keyword_matching'
+                })
             except Exception as e:
-                logger.warning(f"Error generating answer for question '{question}': {str(e)}")
-                answers.append("Unable to find answer in the document.")
+                logger.warning(f"Error answering '{question}': {str(e)}")
+                qa_results.append({
+                    'question': question,
+                    'answer': "Unable to find answer in document.",
+                    'method': 'error'
+                })
         
-        return answers
-    
+        return qa_results
+
     def _find_answer_in_text(self, question: str, sentences: List[str], context_window: int = 2) -> str:
-        """Find answer to question in document sentences using keyword matching"""
+        """Find answer using enhanced keyword matching"""
         question_lower = question.lower()
         
-        # Extract keywords from question (remove common words)
-        stop_words = {'what', 'is', 'the', 'how', 'does', 'are', 'there', 'any', 'and', 'or', 'for', 'in', 'on', 'at', 'to', 'a', 'an'}
-        keywords = [word.strip('?.,!') for word in question_lower.split() if word.strip('?.,!') not in stop_words]
+        # Remove stop words and extract meaningful keywords
+        stop_words = {
+            'what', 'is', 'the', 'how', 'does', 'are', 'there', 'any', 'and', 
+            'or', 'for', 'in', 'on', 'at', 'to', 'a', 'an', 'can', 'will',
+            'would', 'should', 'could', 'when', 'where', 'why', 'who', 'which'
+        }
+        
+        keywords = [
+            word.strip('?.,!') for word in question_lower.split() 
+            if word.strip('?.,!') not in stop_words and len(word.strip('?.,!')) > 2
+        ]
+        
+        if not keywords:
+            return "Question too vague to extract meaningful keywords."
         
         # Score sentences based on keyword matches
         sentence_scores = []
         for i, sentence in enumerate(sentences):
             sentence_lower = sentence.lower()
-            score = sum(1 for keyword in keywords if keyword in sentence_lower)
-            if score > 0:
-                sentence_scores.append((score, i, sentence))
+            
+            # Keyword matching score
+            keyword_score = sum(1 for keyword in keywords if keyword in sentence_lower)
+            
+            # Exact phrase bonus
+            phrase_bonus = 2 if any(kw in sentence_lower for kw in keywords if len(kw) > 4) else 0
+            
+            # Length preference (not too short, not too long)
+            length_score = 1 if 20 <= len(sentence) <= 200 else 0.5
+            
+            total_score = keyword_score + phrase_bonus + length_score
+            
+            if total_score > 0:
+                sentence_scores.append((total_score, i, sentence))
         
         if not sentence_scores:
-            return "No relevant information found in the document."
+            return "No relevant information found for this question."
         
-        # Get the best matching sentence and its context
+        # Get best match with context
         sentence_scores.sort(reverse=True, key=lambda x: x[0])
         best_score, best_index, best_sentence = sentence_scores[0]
         
-        # Extract context (surrounding sentences)
+        # Extract context window
         start_idx = max(0, best_index - context_window)
         end_idx = min(len(sentences), best_index + context_window + 1)
         
@@ -396,79 +461,66 @@ class OptimizedMarkerHandler:
             answer = answer[:497] + "..."
         
         return answer
-    
-    def list_available_models(self) -> Dict[str, bool]:
-        """Check which models are available in S3"""
-        available = {}
+
+    def batch_process_urls(self, urls: List[str], questions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Process multiple URLs in batch"""
+        results = []
         
-        for model_name in self.model_mappings.keys():
+        for url in urls:
             try:
-                # Check if model exists in S3
-                response = self.model_cache.s3_client.list_objects_v2(
-                    Bucket=self.bucket_name,
-                    Prefix=f"models/{model_name}/",
-                    MaxKeys=1
-                )
-                available[model_name] = 'Contents' in response
-            except Exception:
-                available[model_name] = False
+                result = self.process_document_from_url(url, questions)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Failed to process {url}: {str(e)}")
+                results.append({
+                    'success': False,
+                    'error': str(e),
+                    'source_url': url
+                })
         
-        return available
-    
+        return results
+
     def health_check(self) -> Dict[str, Any]:
-        """System health check"""
-        try:
-            # Check S3 connectivity
-            self.model_cache.s3_client.head_bucket(Bucket=self.bucket_name)
-            s3_status = 'ok'
-        except Exception as e:
-            s3_status = f'error: {str(e)}'
-        
-        # Check available models
-        available_models = self.list_available_models()
+        """Check system health"""
+        # Check S3 model availability
+        available_models = self.model_manager.list_available_models()
         
         return {
-            'status': 'healthy' if s3_status == 'ok' else 'degraded',
-            's3_connection': s3_status,
-            'cache_directory': self.model_cache.cache_dir,
-            'document_cache_directory': self.document_cache_dir,
+            'status': 'healthy',
+            'models_loaded': self._models_loaded,
+            'model_bucket': self.model_bucket,
             'available_models': available_models,
-            'downloaded_models': list(self.model_cache._downloaded_models)
+            'gpu_available': self._has_gpu(),
+            'temp_files_count': len(self._temp_files),
+            'document_cache_dir': self.document_cache_dir
         }
-    
+
     def cleanup(self):
-        """Cleanup resources"""
-        # Cleanup model cache
-        self.model_cache.cleanup()
+        """Clean up all resources"""
+        logger.info("Starting cleanup...")
         
-        # Cleanup document cache
+        # Clean up temporary document files
+        for temp_file in self._temp_files.copy():
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+                self._temp_files.remove(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to remove {temp_file}: {str(e)}")
+        
+        # Clean up document cache directory
         if os.path.exists(self.document_cache_dir):
             shutil.rmtree(self.document_cache_dir)
-            logger.info(f"Cleaned up document cache directory: {self.document_cache_dir}")
+        
+        # Clean up model cache
+        self.model_manager.cleanup()
         
         # Clear environment variables
-        for env_var in self.model_mappings.values():
+        model_env_vars = list(self.model_manager.model_mappings.values()) + ['MODEL_CACHE_DIR']
+        for env_var in model_env_vars:
             if env_var in os.environ:
                 del os.environ[env_var]
         
-        if 'MODEL_CACHE_DIR' in os.environ:
-            del os.environ['MODEL_CACHE_DIR']
-        
         logger.info("Cleanup completed")
 
-# Context manager for automatic cleanup
-class MarkerS3Context:
-    """Context manager for marker S3 handler"""
-    
-    def __init__(self, bucket_name: str, region: str = 'us-east-1'):
-        self.bucket_name = bucket_name
-        self.region = region
-        self.handler = None
-    
-    def __enter__(self):
-        self.handler = OptimizedMarkerHandler(self.bucket_name, self.region)
-        return self.handler
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.handler:
-            self.handler.cleanup()
+
