@@ -2,7 +2,7 @@
 import logging
 from typing import List, Dict, Any, Optional
 from pinecone import Pinecone, ServerlessSpec
-from ..config import pinecone_config
+from ..config import pinecone_config, processing_config
 from .embedder import DocumentEmbedder
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ class VectorStore:
     
     def _ensure_index_exists(self):
         """Create index if it doesn't exist"""
+        
         existing_indexes = self.pc.list_indexes().names()
         
         if self.config.index_name not in existing_indexes:
