@@ -117,3 +117,70 @@ class AnswerGenerator:
                     current_length += len(chunk_with_separator)
                 else:
                     break
+            
+            context = truncated_context
+        
+        return context
+    
+    def _build_enhanced_prompt(self, query: str, context: str) -> str:
+        """
+        Build enhanced prompt for better answer generation.
+        
+        Args:
+            query: The question to answer
+            context: Relevant context from document
+        
+        Returns:
+            Formatted prompt string
+        """
+        return f"""You are an AI assistant that answers questions based on provided document context. 
+
+Instructions:
+- Answer the question directly and concisely based ONLY on the provided context
+- If the answer is not in the context, clearly state that the information is not available
+- Be accurate and avoid speculation or information not in the context
+- Keep your answer focused and relevant to the question
+- Use clear, professional language
+- If the question asks about specific conditions, requirements, or limitations, be sure to mention them
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+    
+    def _clean_and_validate_answer(self, answer: str, query: str) -> str:
+        """
+        Clean and validate the generated answer.
+        
+        Args:
+            answer: Raw answer from model
+            query: Original query for validation
+        
+        Returns:
+            Cleaned answer string
+        """
+        # Remove common artifacts
+        answer = answer.replace("Answer:", "").strip()
+        answer = answer.replace("Based on the context", "").strip()
+        answer = answer.replace("According to the document", "").strip()
+        
+        # Remove incomplete sentences at the end
+        sentences = answer.split('.')
+        if len(sentences) > 1 and len(sentences[-1].strip()) < 10:
+            answer = '.'.join(sentences[:-1]) + '.'
+        
+        # Ensure proper capitalization
+        if answer and not answer[0].isupper():
+            answer = answer[0].upper() + answer[1:]
+        
+        # Limit length
+        if len(answer) > self.max_answer_length:
+            answer = answer[:self.max_answer_length-3] + "..."
+        
+        # Validate that answer is not too short
+        if len(answer.strip()) < 10:
+            return "I couldn't find a specific answer to this question in the provided context."
+        
+        return answer

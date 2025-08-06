@@ -93,30 +93,6 @@ class AWSClientManager:
             )
         return self._s3_client
     
-    def list_available_models(self) -> List[Dict[str, Any]]:
-        """List available Bedrock foundation models"""
-        try:
-            response = self.bedrock_agent_client.list_foundation_models()
-            models = response.get('modelSummaries', [])
-            
-            # Filter for Titan models
-            titan_models = [
-                model for model in models 
-                if 'titan' in model.get('modelId', '').lower()
-            ]
-            
-            logger.info(f"Found {len(titan_models)} Titan models available:")
-            for model in titan_models:
-                model_id = model.get('modelId', 'unknown')
-                status = model.get('modelLifecycle', {}).get('status', 'unknown')
-                logger.info(f"  - {model_id} (Status: {status})")
-            
-            return titan_models
-            
-        except Exception as e:
-            logger.error(f"Error listing Bedrock models: {e}")
-            return []
-    
     def invoke_bedrock_model(self, model_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """
         Unified Bedrock model invocation with comprehensive error handling.
@@ -166,11 +142,7 @@ class AWSClientManager:
                 
             elif error_code == 'ResourceNotFoundException':
                 logger.error(f"Model not found: {model_id}")
-                available_models = [m['modelId'] for m in self.list_available_models()]
-                raise ValueError(
-                    f"Model {model_id} not available in region {self.region}. "
-                    f"Available Titan models: {available_models}"
-                )
+                raise ValueError(f"Model {model_id} not available in region {self.region}")
                 
             elif error_code == 'AccessDeniedException':
                 logger.error(f"Access denied for model {model_id}")
@@ -306,14 +278,12 @@ class AWSClientManager:
             return False
     
     def health_check(self) -> Dict[str, Any]:
-        """Comprehensive Bedrock health check"""
+        """Simplified Bedrock health check"""
         health_status = {
             "overall_status": False,
             "aws_credentials": False,
-            "bedrock_access": False,
             "titan_text_model": False,
             "titan_embed_model": False,
-            "available_models": [],
             "region": self.region,
             "errors": []
         }
@@ -325,32 +295,13 @@ class AWSClientManager:
             health_status["aws_credentials"] = True
             logger.info("✅ AWS credentials valid")
             
-            # Test 2: Bedrock access and model listing
-            logger.info("🔍 Checking Bedrock access...")
-            models = self.list_available_models()
-            health_status["available_models"] = [m["modelId"] for m in models]
-            health_status["bedrock_access"] = len(models) > 0
+            # Test 2: Titan text model
+            logger.info("🔍 Testing Titan text model...")
+            health_status["titan_text_model"] = self.test_titan_text_model()
             
-            if health_status["bedrock_access"]:
-                logger.info(f"✅ Bedrock access confirmed ({len(models)} Titan models)")
-            else:
-                logger.warning("⚠️ No Titan models found - check model access in Bedrock console")
-            
-            # Test 3: Titan text model
-            if self.titan_text_model in health_status["available_models"]:
-                logger.info("🔍 Testing Titan text model...")
-                health_status["titan_text_model"] = self.test_titan_text_model()
-            else:
-                health_status["errors"].append(f"Titan text model {self.titan_text_model} not available")
-                logger.error(f"❌ Titan text model {self.titan_text_model} not in available models")
-            
-            # Test 4: Titan embedding model
-            if self.titan_embed_model in health_status["available_models"]:
-                logger.info("🔍 Testing Titan embedding model...")
-                health_status["titan_embed_model"] = self.test_titan_embed_model()
-            else:
-                health_status["errors"].append(f"Titan embed model {self.titan_embed_model} not available")
-                logger.error(f"❌ Titan embedding model {self.titan_embed_model} not in available models")
+            # Test 3: Titan embedding model
+            logger.info("🔍 Testing Titan embedding model...")
+            health_status["titan_embed_model"] = self.test_titan_embed_model()
                 
         except Exception as e:
             health_status["errors"].append(str(e))
@@ -359,7 +310,6 @@ class AWSClientManager:
         # Calculate overall status
         health_status["overall_status"] = (
             health_status["aws_credentials"] and 
-            health_status["bedrock_access"] and
             health_status["titan_text_model"] and 
             health_status["titan_embed_model"]
         )
@@ -373,15 +323,6 @@ class AWSClientManager:
                 logger.warning(f"   - {error}")
         
         return health_status
-    
-    def get_model_info(self, model_id: str) -> Dict[str, Any]:
-        """Get detailed information about a specific model"""
-        try:
-            response = self.bedrock_agent_client.get_foundation_model(modelIdentifier=model_id)
-            return response.get('modelDetails', {})
-        except Exception as e:
-            logger.error(f"Error getting model info for {model_id}: {e}")
-            return {}
 
 # Global client manager instance
 aws_client = AWSClientManager()

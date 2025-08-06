@@ -123,22 +123,7 @@ class S3ModelManager:
         os.environ['MODEL_CACHE_DIR'] = self.cache_dir
         logger.info(f"Set MODEL_CACHE_DIR = {self.cache_dir}")
     
-    def list_available_models(self) -> Dict[str, bool]:
-        """Check which models are available in S3"""
-        available = {}
-        
-        for model_name in self.model_mappings.keys():
-            try:
-                response = self.s3_client.list_objects_v2(
-                    Bucket=self.bucket_name,
-                    Prefix=f"models/{model_name}/",
-                    MaxKeys=1
-                )
-                available[model_name] = 'Contents' in response
-            except Exception:
-                available[model_name] = False
-        
-        return available
+
     
     def cleanup(self):
         """Clean up temporary cache directory"""
@@ -681,9 +666,6 @@ class MarkerHandlerWithS3Models:
 
     def health_check(self) -> Dict[str, Any]:
         """Check system health including Bedrock integration"""
-        # Check S3 model availability
-        available_models = self.model_manager.list_available_models()
-        
         # Check Bedrock connection if enabled
         bedrock_status = False
         if self.use_bedrock_qa and self.bedrock_client:
@@ -696,7 +678,6 @@ class MarkerHandlerWithS3Models:
             'status': 'healthy',
             'models_loaded': self._models_loaded,
             'model_bucket': self.model_bucket,
-            'available_models': available_models,
             'gpu_available': self._has_gpu(),
             'temp_files_count': len(self._temp_files),
             'document_cache_dir': self.document_cache_dir,

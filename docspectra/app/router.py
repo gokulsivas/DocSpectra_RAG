@@ -2,17 +2,23 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
-from .utils.document_processor import DocumentProcessor
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ✅ PROPER INITIALIZATION: Create processor instance ONCE at module level
-# This replaces all your individual imports and creates a single orchestrator
-processor = DocumentProcessor()
-# In your router.py - add this line after the processor initialization
-logger.info("✅ DocumentProcessor initialized successfully")
+# ✅ LAZY INITIALIZATION: Create processor instance when needed
+# This avoids immediate Pinecone connection attempts during import
+_processor = None
+
+def get_processor():
+    """Get or create DocumentProcessor instance"""
+    global _processor
+    if _processor is None:
+        from .utils.document_processor import DocumentProcessor
+        _processor = DocumentProcessor()
+        logger.info("✅ DocumentProcessor initialized successfully")
+    return _processor
 
 # ✅ Updated models to match HackRx API format
 class QueryRequest(BaseModel):
@@ -39,6 +45,9 @@ async def process_query(req: QueryRequest) -> Dict[str, Any]:
     try:
         logger.info(f"Processing document: {req.documents}")
         logger.info(f"Questions: {len(req.questions)}")
+        
+        # ✅ Get processor instance (initialized on first use)
+        processor = get_processor()
         
         # ✅ SINGLE CALL to orchestrator (replaces your 5 separate function calls)
         result = processor.process_document_qa(
@@ -67,6 +76,9 @@ async def process_query(req: QueryRequest) -> Dict[str, Any]:
 async def health_check():
     """Check system health"""
     try:
+        # Get processor instance
+        processor = get_processor()
+        
         # Check vector store health
         vector_health = processor.vector_store.health_check()
         

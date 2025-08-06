@@ -33,6 +33,11 @@ aws_config = AWSConfig()
 pinecone_config = PineconeConfig()
 processing_config = ProcessingConfig()
 
-# Add validation to ensure critical configs are set
-if not pinecone_config.api_key:
-    raise ValueError("PINECONE_API_KEY environment variable is required")
+# Add validation function that can be called when needed
+def validate_config():
+    """Validate that required environment variables are set"""
+    if not pinecone_config.api_key:
+        raise ValueError("PINECONE_API_KEY environment variable is required")
+    
+    if not aws_config.s3_bucket:
+        raise ValueError("MARKER_S3_BUCKET environment variable is required")
