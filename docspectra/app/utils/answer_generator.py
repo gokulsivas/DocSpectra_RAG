@@ -1,34 +1,52 @@
-import boto3
-import os
+# app/utils/answer_generator.py
+import logging
+from typing import List, Dict, Any
+from .aws_client import aws_client
+from ..config import aws_config, processing_config
 
-client = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_DEFAULT_REGION"))
+logger = logging.getLogger(__name__)
 
-def generate_answer(query: str, chunks: list[str]) -> list:
-    context = "\n\n".join(chunks)
-    prompt = f"""You are an AI assistant helping users understand insurance policies.
+class AnswerGenerator:
+    """Simplified answer generation service"""
+    
+    def __init__(self):
+        self.model_id = aws_config.titan_model_id
+        self.config = processing_config
+    
+    def generate_answer(self, query: str, context_chunks: List[str]) -> str:
+        """Generate answer from query and context"""
+        try:
+            context = "\n\n".join(context_chunks)
+            
+            prompt = self._build_prompt(query, context)
+            
+            body = {
+                "inputText": prompt,
+                "textGenerationConfig": {
+                    "temperature": self.config.temperature,
+                    "maxTokenCount": self.config.max_tokens,
+                    "topP": self.config.top_p,
+                    "stopSequences": []
+                }
+            }
+            
+            result = aws_client.invoke_bedrock_model(self.model_id, body)
+            answer = result["results"][0]["outputText"].strip()
+            
+            logger.info("Successfully generated answer")
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            return "I apologize, but I couldn't generate an answer due to a technical issue."
+    
+    def _build_prompt(self, query: str, context: str) -> str:
+        """Build prompt for answer generation"""
+        return f"""You are an AI assistant helping users understand documents.
 
 Context:
 {context}
 
 Question: {query}
+
 Answer:"""
-
-    body = {
-        "inputText": prompt,
-        "textGenerationConfig": {
-            "temperature": 0.7,
-            "maxTokenCount": 300,
-            "topP": 0.9,
-            "stopSequences": []
-        }
-    }
-
-    response = client.invoke_model(
-        modelId=os.getenv("TITAN_MODEL_ID"),
-        contentType="application/json",
-        accept="application/json",
-        body=bytes(str(body).replace("'", '"'), "utf-8"),
-    )
-
-    result = eval(response['body'].read().decode())
-    return [{"clause": c.strip()} for c in result["results"][0]["outputText"].split("\n") if c.strip()]

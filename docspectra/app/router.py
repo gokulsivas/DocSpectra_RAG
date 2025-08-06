@@ -1,65 +1,80 @@
+# app/router.py - Corrected version
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
+from .utils.document_processor import DocumentProcessor
+import logging
 
-from .utils.marker_handler import parse_pdf_from_url
-from .utils.chunker import chunk_text
-from .utils.embedder import embed_chunks
-from .utils.vector_store import store_and_search_chunks
-from .utils.answer_generator import generate_answer
-
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# ✅ PROPER INITIALIZATION: Create processor instance ONCE at module level
+# This replaces all your individual imports and creates a single orchestrator
+processor = DocumentProcessor()
+# In your router.py - add this line after the processor initialization
+logger.info("✅ DocumentProcessor initialized successfully")
 
+# ✅ Updated models to match HackRx API format
 class QueryRequest(BaseModel):
-    url: str
-    query: str
-
-
-class AnswerItem(BaseModel):
-    clause: str
-
+    documents: str  # Changed from 'url' to match API spec
+    questions: List[str]  # Changed from single 'query' to list of questions
 
 class QueryResponse(BaseModel):
-    answers: List[AnswerItem]
-
+    answers: List[str]  # Direct list of answer strings
 
 @router.post(
     "/run",
     response_model=QueryResponse,
-    summary="Process a PDF URL and return top-matched clauses"
+    summary="Process document URL and answer multiple questions"
 )
 async def process_query(req: QueryRequest) -> Dict[str, Any]:
     """
-    End-to-end semantic search:
-    1️⃣ Download + parse PDF from URL
-    2️⃣ Tokenize into chunks
-    3️⃣ Embed chunks + query
-    4️⃣ Store into Pinecone, retrieve top-k
-    5️⃣ Use Titan to generate human-readable clauses
+    Enhanced end-to-end processing:
+    1️⃣ Download + parse PDF using S3-cached Marker models
+    2️⃣ Chunk with sentence boundary awareness  
+    3️⃣ Generate embeddings with AWS Titan
+    4️⃣ Store in Pinecone + retrieve relevant chunks
+    5️⃣ Generate answers using AWS Titan LLM
     """
     try:
-        raw_text = parse_pdf_from_url(req.url)
+        logger.info(f"Processing document: {req.documents}")
+        logger.info(f"Questions: {len(req.questions)}")
+        
+        # ✅ SINGLE CALL to orchestrator (replaces your 5 separate function calls)
+        result = processor.process_document_qa(
+            document_url=req.documents,
+            questions=req.questions
+        )
+        
+        if not result['success']:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processing failed: {result.get('error', 'Unknown error')}"
+            )
+        
+        # ✅ Return answers in correct format
+        return QueryResponse(answers=result['answers'])
+        
     except Exception as e:
+        logger.error(f"Error in process_query: {str(e)}")
         raise HTTPException(
-            status_code=400,
-            detail=f"PDF parsing failed: {e}"
+            status_code=500, 
+            detail=f"Processing pipeline error: {str(e)}"
         )
 
+# ✅ Add health check endpoint
+@router.get("/health")
+async def health_check():
+    """Check system health"""
     try:
-        chunks = chunk_text(raw_text)
-        embeddings = embed_chunks(chunks)
-        top_chunks = store_and_search_chunks(embeddings, req.query)
-        answers = generate_answer(req.query, top_chunks)
+        health = processor.vector_store.pc.list_indexes()
+        return {
+            "status": "healthy",
+            "pinecone": "connected",
+            "s3_models": "cached"
+        }
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing pipeline error: {e}"
-        )
-
-    # Ensure each answer is wrapped in AnswerItem
-    results = [
-        AnswerItem(clause=a["clause"]) if isinstance(a, dict) else AnswerItem(clause=str(a))
-        for a in answers
-    ]
-    return {"answers": results}
+        return {
+            "status": "unhealthy", 
+            "error": str(e)
+        }

@@ -1,25 +1,41 @@
-import boto3, os, json
-from botocore.exceptions import ClientError
+# app/utils/embedder.py
+import logging
+from typing import List, Dict, Any
+from .aws_client import aws_client
+from ..config import aws_config
 
-model_id = os.getenv("TITAN_EMBED_MODEL")
-region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+logger = logging.getLogger(__name__)
 
-client = boto3.client("bedrock-runtime", region_name=region)
-
-def embed_chunks(chunks: list[str]) -> list[dict]:
-    embeddings = []
-    for chunk in chunks:
-        body = {"inputText": chunk}
-        try:
-            response = client.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(body).encode("utf-8"),
-            )
-        except ClientError as e:
-            print("Bedrock invoke_model failed:", e)
-            raise
-        result = json.loads(response['body'].read().decode())
-        embeddings.append({"text": chunk, "embedding": result["embedding"]})
-    return embeddings
+class DocumentEmbedder:
+    """Simplified document embedding service"""
+    
+    def __init__(self):
+        self.model_id = aws_config.titan_embed_model
+    
+    def embed_texts(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Embed multiple texts and return with metadata"""
+        embeddings = []
+        
+        for i, text in enumerate(texts):
+            try:
+                embedding = self._embed_single_text(text)
+                embeddings.append({
+                    "id": f"chunk_{i}",
+                    "text": text,
+                    "embedding": embedding
+                })
+            except Exception as e:
+                logger.warning(f"Failed to embed text chunk {i}: {e}")
+                continue
+                
+        return embeddings
+    
+    def _embed_single_text(self, text: str) -> List[float]:
+        """Embed single text"""
+        body = {"inputText": text}
+        result = aws_client.invoke_bedrock_model(self.model_id, body)
+        return result["embedding"]
+    
+    def embed_query(self, query: str) -> List[float]:
+        """Embed a single query"""
+        return self._embed_single_text(query)
