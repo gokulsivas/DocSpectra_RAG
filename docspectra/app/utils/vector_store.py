@@ -1,8 +1,9 @@
-# app/utils/vector_store.py
+# app/utils/vector_store.py - FIXED VERSION
 import logging
 from typing import List, Dict, Any, Optional
-from pinecone import Pinecone, ServerlessSpec
-from ..config import pinecone_config, processing_config
+import pinecone
+from pinecone import ServerlessSpec
+from ..config import pinecone_config, processing_config  # FIXED: Added processing_config
 from .embedder import DocumentEmbedder
 
 logger = logging.getLogger(__name__)
@@ -13,32 +14,29 @@ class VectorStore:
     def __init__(self):
         self.config = pinecone_config
         self.embedder = DocumentEmbedder()
-        self._pc = None
         self._index = None
         
-    @property
-    def pc(self):
-        """Lazy-loaded Pinecone client"""
-        if self._pc is None:
-            self._pc = Pinecone(api_key=self.config.api_key)
-        return self._pc
-    
+        # FIXED: Initialize Pinecone with v3 API using config values
+        pinecone.init(
+            api_key=self.config.api_key,        # This gets PINECONE_API_KEY from env
+            environment=self.config.environment  # This gets PINECONE_ENV from env
+        )
+        
     @property 
     def index(self):
         """Lazy-loaded Pinecone index"""
         if self._index is None:
             self._ensure_index_exists()
-            self._index = self.pc.Index(self.config.index_name)
+            self._index = pinecone.Index(self.config.index_name)
         return self._index
     
     def _ensure_index_exists(self):
-        """Create index if it doesn't exist"""
-        
-        existing_indexes = self.pc.list_indexes().names()
+        """Create index if it doesn't exist - FIXED for v3 API"""
+        existing_indexes = pinecone.list_indexes()
         
         if self.config.index_name not in existing_indexes:
             logger.info(f"Creating Pinecone index: {self.config.index_name}")
-            self.pc.create_index(
+            pinecone.create_index(
                 name=self.config.index_name,
                 dimension=self.config.dimension,
                 metric="cosine",
@@ -78,7 +76,7 @@ class VectorStore:
     
     def search_similar(self, query: str, top_k: int = None) -> List[str]:
         """Search for similar documents"""
-        top_k = top_k or processing_config.top_k_retrieval
+        top_k = top_k or self.config.top_k_retrieval  # FIXED: Use self.config instead of processing_config
         
         try:
             # Embed the query
