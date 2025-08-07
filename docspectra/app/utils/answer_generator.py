@@ -1,5 +1,6 @@
-# app/utils/answer_generator.py - Enhanced with Bedrock Titan integration
+# app/utils/answer_generator.py - Titan Q&A Integration with RAG
 import logging
+import json
 from typing import List, Dict, Any
 from .aws_client import aws_client
 from ..config import aws_config, processing_config
@@ -7,177 +8,204 @@ from ..config import aws_config, processing_config
 logger = logging.getLogger(__name__)
 
 class AnswerGenerator:
-    """Enhanced answer generation service with Bedrock Titan integration"""
+    """Titan Q&A integration for document processing with RAG support"""
     
     def __init__(self):
         self.model_id = aws_config.titan_model_id
-        self.config = processing_config
-        
-        # Answer generation parameters
-        self.max_context_length = 4000  # Maximum context to send to Titan
-        self.max_answer_length = 800   # Maximum answer length
         
         logger.info(f"AnswerGenerator initialized with model: {self.model_id}")
-        logger.info(f"Max context length: {self.max_context_length}")
     
-    def generate_answer(self, query: str, context_chunks: List[str]) -> str:
+    def generate_answers_titan(self, ocr_text: str, questions: List[str]) -> Dict[str, Any]:
         """
-        Generate answer from query and context using Bedrock Titan.
+        Generate answers for multiple questions using Titan Q&A with JSON output format.
         
         Args:
-            query: The question to answer
-            context_chunks: List of relevant text chunks from the document
+            ocr_text: The OCR text from the document
+            questions: List of questions to answer
         
         Returns:
-            Generated answer string
+            Dictionary with 'answers' list or error information
         """
         try:
             # Validate inputs
-            if not query or not query.strip():
-                return "Error: Question cannot be empty."
+            if not ocr_text or not ocr_text.strip():
+                return {
+                    "error": "OCR text cannot be empty",
+                    "answers": []
+                }
             
-            if not context_chunks:
-                return "I don't have enough context information to answer this question."
+            if not questions or len(questions) == 0:
+                return {
+                    "error": "Questions list cannot be empty",
+                    "answers": []
+                }
             
-            # Prepare and optimize context
-            context = self._prepare_context(context_chunks)
+            # Format questions block
+            question_block = "\n".join([f"- {q}" for q in questions])
             
-            if not context.strip():
-                return "I couldn't find relevant information to answer this question."
+            # Build Titan prompt for JSON output
+            prompt = f"""
+You are an expert assistant that answers questions based only on the provided document text.
+
+Document Content:
+\"\"\"
+{ocr_text.strip()}
+\"\"\"
+
+Below are several questions based on the document. Provide the answers in the following JSON format:
+{{
+  "answers": [
+    "...", "...", ...
+  ]
+}}
+
+Do not return any explanation or text outside the JSON. Just return the JSON with answers in the same order.
+
+Questions:
+{question_block}
+            """.strip()
             
-            # Build enhanced prompt
-            prompt = self._build_enhanced_prompt(query.strip(), context)
-            
-            # Generate answer using Bedrock Titan
+            # Generate answers using Bedrock Titan
             body = {
                 "inputText": prompt,
                 "textGenerationConfig": {
-                    "temperature": self.config.temperature,
-                    "maxTokenCount": self.config.max_tokens,
-                    "topP": self.config.top_p,
-                    "stopSequences": [
-                        "Human:", "Context:", "Question:", 
-                        "\n\n---", "END_ANSWER", "[Context"
-                    ]
+                    "maxTokenCount": aws_config.max_tokens,
+                    "temperature": aws_config.temperature,
+                    "topP": aws_config.top_p,
+                    "stopSequences": []
                 }
             }
             
             result = aws_client.invoke_bedrock_model(self.model_id, body)
             
             if "results" not in result or len(result["results"]) == 0:
-                return "Error: Invalid response from language model."
+                return {
+                    "error": "Invalid response from language model",
+                    "answers": []
+                }
+            
+            result_text = result["results"][0]["outputText"]
+            
+            # Attempt to parse strictly as JSON
+            try:
+                parsed = json.loads(result_text)
+                if "answers" in parsed:
+                    logger.info(f"Successfully generated {len(parsed['answers'])} answers")
+                    return parsed
+                else:
+                    logger.warning("Valid JSON but missing 'answers' key")
+                    return {
+                        "error": "Valid JSON but missing 'answers' key",
+                        "raw_output": result_text
+                    }
+            except json.JSONDecodeError:
+                logger.warning("Model output is not valid JSON")
+                return {
+                    "error": "Model output is not valid JSON",
+                    "raw_output": result_text
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in Titan Q&A: {str(e)}")
+            return {
+                "error": f"Titan Q&A failed: {str(e)}",
+                "answers": []
+            }
+    
+    def generate_answer_with_context(self, question: str, context: str) -> Dict[str, Any]:
+        """
+        Generate a single answer using Titan with relevant context chunks (RAG approach).
+        
+        Args:
+            question: The question to answer
+            context: Relevant context chunks from vector search
+        
+        Returns:
+            Dictionary with 'answer' or error information
+        """
+        try:
+            # Validate inputs
+            if not question or not question.strip():
+                return {
+                    "error": "Question cannot be empty",
+                    "answer": ""
+                }
+            
+            if not context or not context.strip():
+                return {
+                    "error": "Context cannot be empty",
+                    "answer": ""
+                }
+            
+            # Build RAG prompt with context
+            prompt = f"""
+You are an expert assistant that answers questions based only on the provided document context.
+
+Context from Document:
+\"\"\"
+{context.strip()}
+\"\"\"
+
+Question: {question.strip()}
+
+Instructions:
+- Answer the question based ONLY on the provided context
+- If the answer is not in the context, clearly state that the information is not available
+- Be accurate and avoid speculation
+- Provide a clear, concise answer
+
+Answer:"""
+            
+            # Generate answer using Bedrock Titan
+            body = {
+                "inputText": prompt,
+                "textGenerationConfig": {
+                    "maxTokenCount": aws_config.max_tokens,
+                    "temperature": aws_config.temperature,
+                    "topP": aws_config.top_p,
+                    "stopSequences": []
+                }
+            }
+            
+            result = aws_client.invoke_bedrock_model(self.model_id, body)
+            
+            if "results" not in result or len(result["results"]) == 0:
+                return {
+                    "error": "Invalid response from language model",
+                    "answer": ""
+                }
             
             answer = result["results"][0]["outputText"].strip()
             
-            # Post-process and clean the answer
-            answer = self._clean_and_validate_answer(answer, query)
+            # Clean up the answer
+            answer = self._clean_answer(answer)
             
-            logger.info(f"Generated answer: {len(answer)} characters")
-            return answer
-            
+            logger.info(f"Generated RAG answer: {len(answer)} characters")
+            return {
+                "answer": answer
+            }
+                
         except Exception as e:
-            logger.error(f"Error generating answer: {e}")
-            return f"I apologize, but I encountered an error while generating the answer: {str(e)}"
+            logger.error(f"Error in RAG answer generation: {str(e)}")
+            return {
+                "error": f"RAG answer generation failed: {str(e)}",
+                "answer": ""
+            }
     
-    def _prepare_context(self, context_chunks: List[str]) -> str:
-        """
-        Prepare and optimize context from chunks for better answer generation.
-        
-        Args:
-            context_chunks: List of text chunks
-        
-        Returns:
-            Optimized context string
-        """
-        # Remove empty chunks and duplicates
-        valid_chunks = []
-        seen_chunks = set()
-        
-        for chunk in context_chunks:
-            chunk = chunk.strip()
-            if chunk and chunk not in seen_chunks:
-                valid_chunks.append(chunk)
-                seen_chunks.add(chunk)
-        
-        if not valid_chunks:
-            return ""
-        
-        # Join chunks with clear separators
-        context = "\n\n---\n\n".join(valid_chunks)
-        
-        # Truncate if too long, keeping whole chunks when possible
-        if len(context) > self.max_context_length:
-            truncated_context = ""
-            current_length = 0
-            
-            for chunk in valid_chunks:
-                chunk_with_separator = chunk + "\n\n---\n\n"
-                if current_length + len(chunk_with_separator) <= self.max_context_length:
-                    truncated_context += chunk_with_separator
-                    current_length += len(chunk_with_separator)
-                else:
-                    break
-            
-            context = truncated_context
-        
-        return context
-    
-    def _build_enhanced_prompt(self, query: str, context: str) -> str:
-        """
-        Build enhanced prompt for better answer generation.
-        
-        Args:
-            query: The question to answer
-            context: Relevant context from document
-        
-        Returns:
-            Formatted prompt string
-        """
-        return f"""You are an AI assistant that answers questions based on provided document context. 
-
-Instructions:
-- Answer the question directly and concisely based ONLY on the provided context
-- If the answer is not in the context, clearly state that the information is not available
-- Be accurate and avoid speculation or information not in the context
-- Keep your answer focused and relevant to the question
-- Use clear, professional language
-- If the question asks about specific conditions, requirements, or limitations, be sure to mention them
-
-Context:
-{context}
-
-Question: {query}
-
-Answer:"""
-    
-    def _clean_and_validate_answer(self, answer: str, query: str) -> str:
-        """
-        Clean and validate the generated answer.
-        
-        Args:
-            answer: Raw answer from model
-            query: Original query for validation
-        
-        Returns:
-            Cleaned answer string
-        """
+    def _clean_answer(self, answer: str) -> str:
+        """Clean and validate the generated answer"""
         # Remove common artifacts
         answer = answer.replace("Answer:", "").strip()
         answer = answer.replace("Based on the context", "").strip()
         answer = answer.replace("According to the document", "").strip()
-        
-        # Remove incomplete sentences at the end
-        sentences = answer.split('.')
-        if len(sentences) > 1 and len(sentences[-1].strip()) < 10:
-            answer = '.'.join(sentences[:-1]) + '.'
         
         # Ensure proper capitalization
         if answer and not answer[0].isupper():
             answer = answer[0].upper() + answer[1:]
         
         # Limit length
-        if len(answer) > self.max_answer_length:
-            answer = answer[:self.max_answer_length-3] + "..."
+        if len(answer) > 800:
+            answer = answer[:797] + "..."
         
         # Validate that answer is not too short
         if len(answer.strip()) < 10:
