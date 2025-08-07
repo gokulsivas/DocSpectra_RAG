@@ -28,7 +28,7 @@ class S3ModelManager:
     def __init__(self, bucket_name: str, region: str = 'us-east-1'):
         self.bucket_name = bucket_name
         self.region = region
-        self.cache_dir = tempfile.mkdtemp(prefix='marker_models_')
+        self.cache_dir = tempfile.mkdtemp(prefix='docspectra_models_')
         self._cache_lock = threading.Lock()
         self._downloaded_models = set()
         
@@ -49,7 +49,7 @@ class S3ModelManager:
     def _download_model_from_s3(self, model_name: str) -> str:
         """Download model from S3 to local cache"""
         local_model_path = os.path.join(self.cache_dir, model_name)
-        s3_prefix = f"marker_models/{model_name}/"
+        s3_prefix = f"docspectra_models/{model_name}/"
         
         if model_name in self._downloaded_models:
             logger.info(f"Model {model_name} already cached locally")
