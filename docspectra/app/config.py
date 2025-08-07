@@ -30,6 +30,7 @@ class ProcessingConfig:
     """Processing configuration"""
     chunk_size: int = int(os.getenv('CHUNK_SIZE', '1000'))
     chunk_overlap: int = int(os.getenv('CHUNK_OVERLAP', '200'))
+    chunk_max_words: int = int(os.getenv('CHUNK_MAX_WORDS', '150'))
     top_k_retrieval: int = int(os.getenv('TOP_K_RETRIEVAL', '5'))
 
 # Global config instances - MAKE SURE these are created
