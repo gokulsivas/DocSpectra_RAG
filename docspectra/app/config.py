@@ -8,7 +8,7 @@ class AWSConfig:
     """AWS configuration with Titan support"""
     region: str = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
     s3_bucket: str = os.getenv('MARKER_S3_BUCKET', '')
-    titan_model_id: str = os.getenv('TITAN_MODEL_ID', 'amazon.titan-text-express-v1')
+    titan_model_id: str = os.getenv('TITAN_MODEL_ID', 'amazon.titan-text-express-v1:0')
     titan_embed_model: str = os.getenv('TITAN_EMBED_MODEL', 'amazon.titan-embed-text-v1')
     temperature: float = float(os.getenv('TEMPERATURE', '0.3'))
     top_p: float = float(os.getenv('TOP_P', '0.9'))
