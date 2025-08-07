@@ -686,11 +686,9 @@ class MarkerHandlerWithS3Models:
             'bedrock_model': getattr(self.bedrock_client, 'titan_model_id', 'N/A') if self.bedrock_client else 'N/A'
         }
 
-    def cleanup(self):
-        """Clean up all resources"""
-        logger.info("Starting cleanup...")
-        
-        # Clean up temporary document files
+    def cleanup_temp_documents(self):
+        """Clean up only temporary document files and document cache directory"""
+        logger.info("Cleaning up temporary document files...")
         for temp_file in self._temp_files.copy():
             try:
                 if os.path.exists(temp_file):
@@ -698,20 +696,21 @@ class MarkerHandlerWithS3Models:
                 self._temp_files.remove(temp_file)
             except Exception as e:
                 logger.warning(f"Failed to remove {temp_file}: {str(e)}")
-        
-        # Clean up document cache directory
         if os.path.exists(self.document_cache_dir):
             shutil.rmtree(self.document_cache_dir)
-        
-        # Clean up model cache
+        logger.info("Temporary document cleanup completed")
+
+    def cleanup(self):
+        """Clean up all resources (manual call only)"""
+        logger.info("Starting full cleanup...")
+        self.cleanup_temp_documents()
+        # Clean up model cache (manual only)
         self.model_manager.cleanup()
-        
         # Clear environment variables
         model_env_vars = list(self.model_manager.model_mappings.values()) + ['MODEL_CACHE_DIR']
         for env_var in model_env_vars:
             if env_var in os.environ:
                 del os.environ[env_var]
-        
         logger.info("Cleanup completed")
 
 # Context manager for easy usage
@@ -731,8 +730,4 @@ class MarkerS3Context:
         return self.handler
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.handler.cleanup()
-    
-    def process_document_from_url(self, document_url: str, **kwargs):
-        """Wrapper method for DocumentProcessor integration"""
-        return self.handler.process_document_from_url(document_url, **kwargs)
+        self.handler.cleanup_temp_documents()  # Only clean up temp documents after each query
