@@ -11,6 +11,20 @@ import threading
 from functools import lru_cache
 import requests
 from urllib.parse import urlparse
+import multiprocessing
+
+try:
+    # Prefer pypdf; fallback to PyPDF2
+    from pypdf import PdfReader, PdfWriter  # type: ignore
+    _PDF_LIB = "pypdf"
+except Exception:
+    try:
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+        _PDF_LIB = "PyPDF2"
+    except Exception:
+        PdfReader = None  # type: ignore
+        PdfWriter = None  # type: ignore
+        _PDF_LIB = None
 
 # Modern Marker imports
 from marker.converters.pdf import PdfConverter
@@ -21,6 +35,33 @@ from marker.config.parser import ConfigParser
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Shared in-process model artifacts to avoid re-initialization per request
+_SHARED_MODELS: Dict[str, Any] = {
+    "loaded": False,
+    "model_dict": None,
+    "converter": None,
+}
+
+# Helper to optimize thread usage on CPU
+def _configure_cpu_runtime():
+    try:
+        cpu_count = max(1, multiprocessing.cpu_count())
+        # Leave 1 core free for OS/background
+        threads = max(1, min(4, cpu_count - 1))
+        os.environ.setdefault("TORCH_DEVICE", "cpu")
+        os.environ.setdefault("OMP_NUM_THREADS", str(threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(threads))
+        os.environ.setdefault("TOKENIZER_PARALLELISM", "false")
+        os.environ.setdefault("SURYA_NUM_WORKERS", str(max(1, min(2, threads))))
+        try:
+            import torch
+            torch.set_num_threads(threads)
+        except Exception:
+            pass
+        logger.info(f"CPU runtime configured: threads={threads}")
+    except Exception as e:
+        logger.warning(f"Failed to configure CPU runtime: {e}")
 
 class S3ModelManager:
     """Manages downloading and caching models from S3 for Marker"""
@@ -335,11 +376,14 @@ class MarkerHandlerWithS3Models:
         # Setup models from S3 into persistent cache
         self.model_manager.setup_model_environment()
         
+        # Optimize for CPU-only execution
+        _configure_cpu_runtime()
+        
         # Additional Marker configuration
-        os.environ.setdefault("TORCH_DEVICE", "cuda" if self._has_gpu() else "cpu")
-        # Tuning flags for performance; adjust as needed
+        os.environ["TORCH_DEVICE"] = "cpu"
         os.environ.setdefault("OCR_ENGINE", "surya")
-        os.environ.setdefault("EXTRACT_IMAGES", "false")  # disable image extraction for speed
+        # Disable image extraction for CPU speedups
+        os.environ["EXTRACT_IMAGES"] = "false"
         
         if self.batch_multiplier > 1:
             os.environ["BATCH_MULTIPLIER"] = str(self.batch_multiplier)
@@ -357,18 +401,26 @@ class MarkerHandlerWithS3Models:
         if not self._models_loaded:
             with self._cache_lock:
                 if not self._models_loaded:  # Double-check locking
-                    logger.info("Setting up Marker models from S3...")
+                    # Reuse shared models if already initialized in-process
+                    if _SHARED_MODELS["loaded"]:
+                        self._model_dict = _SHARED_MODELS["model_dict"]
+                        self._converter = _SHARED_MODELS["converter"]
+                        self._models_loaded = True
+                        logger.info("Marker models already initialized in process (reusing shared models)")
+                        return
+
+                    logger.info("Setting up Marker models (using persistent cache if available)...")
                     
                     # Setup environment with S3 models
                     self._setup_marker_environment()
                     
-                    # Create model dictionary with our S3 models
+                    # Create model dictionary with our S3 models (loaded from local cache paths)
                     self._model_dict = create_model_dict()
                     
                     # Configure Marker
                     config = {
                         "output_format": "markdown",
-                        "extract_images": True,
+                        "extract_images": False,
                     }
                     
                     if self.use_llm:
@@ -386,8 +438,12 @@ class MarkerHandlerWithS3Models:
                         llm_service=config_parser.get_llm_service() if self.use_llm else None
                     )
                     
+                    # Mark as loaded and store in shared cache
                     self._models_loaded = True
-                    logger.info("Marker models loaded successfully from S3")
+                    _SHARED_MODELS["loaded"] = True
+                    _SHARED_MODELS["model_dict"] = self._model_dict
+                    _SHARED_MODELS["converter"] = self._converter
+                    logger.info("Marker models initialized successfully (from local cache)")
 
     def download_document_from_url(self, url: str) -> str:
         """Download document from URL to temporary local file"""
@@ -466,15 +522,79 @@ class MarkerHandlerWithS3Models:
             raise
 
     def convert_pdf_to_markdown(self, pdf_path: str, **kwargs) -> Tuple[str, Dict, List]:
-        """Convert PDF to markdown using S3 models"""
+        """Convert PDF to markdown using S3 models with optional page controls
+        
+        Supported kwargs:
+        - page_start (int, 1-based, inclusive)
+        - page_end (int, 1-based, inclusive)
+        - page_batch_size (int, >0 to process in batches)
+        """
         try:
             # Ensure S3 models are loaded
             self._ensure_models_loaded()
-            
+
+            page_start = kwargs.get("page_start")
+            page_end = kwargs.get("page_end")
+            page_batch_size = kwargs.get("page_batch_size", 0) or 0
+
+            # Helper to subset pages to a temp PDF
+            def _subset(pdf_in: str, start_1b: int, end_1b: int) -> str:
+                if _PDF_LIB is None or PdfReader is None or PdfWriter is None:
+                    logger.warning("PDF subsetting requested but no PDF library available; processing full document")
+                    return pdf_in
+                reader = PdfReader(pdf_in)
+                total = len(reader.pages)
+                s = max(1, min(start_1b, total))
+                e = max(s, min(end_1b, total))
+                writer = PdfWriter()
+                for i in range(s-1, e):
+                    writer.add_page(reader.pages[i])
+                tmp_path = tempfile.NamedTemporaryFile(dir=self.document_cache_dir, suffix="_subset.pdf", delete=False).name
+                with open(tmp_path, "wb") as f:
+                    writer.write(f)
+                self._temp_files.add(tmp_path)
+                return tmp_path
+
             logger.info(f"Converting PDF: {pdf_path}")
-            
+
+            # If batching enabled, process in batches and concatenate
+            if page_batch_size > 0 and _PDF_LIB is not None and PdfReader is not None:
+                reader = PdfReader(pdf_path)
+                total_pages = len(reader.pages)
+                s = 1 if page_start is None else max(1, page_start)
+                e = total_pages if page_end is None else min(total_pages, page_end)
+                markdown_parts: List[str] = []
+                all_images: List[Any] = []
+                combined_meta: Dict[str, Any] = {"batches": []}
+                for batch_start in range(s, e+1, page_batch_size):
+                    batch_end = min(e, batch_start + page_batch_size - 1)
+                    subset_path = _subset(pdf_path, batch_start, batch_end)
+                    rendered = self._converter(subset_path)
+                    md, meta, images = text_from_rendered(rendered)
+                    markdown_parts.append(md)
+                    combined_meta["batches"].append({"start": batch_start, "end": batch_end, "meta": meta})
+                    if images:
+                        all_images.extend(images)
+                markdown_text = "\n\n\n".join(markdown_parts)
+                metadata = combined_meta
+                images = all_images
+                return markdown_text, metadata, images
+
+            # Else single pass, possibly with a single range
+            run_path = pdf_path
+            if page_start is not None or page_end is not None:
+                # If only one bound provided, infer the other using reader when possible
+                if _PDF_LIB is not None and PdfReader is not None:
+                    reader = PdfReader(pdf_path)
+                    total = len(reader.pages)
+                else:
+                    total = None
+                s = 1 if page_start is None else page_start
+                e = (total if total is not None else s) if page_end is None else page_end
+                run_path = _subset(pdf_path, s, e)
+
             # Convert PDF using Marker with S3 models
-            rendered = self._converter(pdf_path)
+            rendered = self._converter(run_path)
             markdown_text, metadata, images = text_from_rendered(rendered)
             
             return markdown_text, metadata, images
@@ -487,14 +607,17 @@ class MarkerHandlerWithS3Models:
                                 document_url: str,
                                 questions: Optional[List[str]] = None,
                                 **kwargs) -> Dict[str, Any]:
-        """Process document from URL using S3 models"""
+        """Process document from URL using S3 models
+        
+        Optional kwargs: page_start, page_end, page_batch_size
+        """
         temp_document_path = None
         
         try:
             # Download document
             temp_document_path = self.download_document_from_url(document_url)
             
-            # Convert to markdown
+            # Convert to markdown (supports page controls)
             markdown_text, metadata, images = self.convert_pdf_to_markdown(
                 temp_document_path, **kwargs
             )
