@@ -28,7 +28,10 @@ class S3ModelManager:
     def __init__(self, bucket_name: str, region: str = 'us-east-1'):
         self.bucket_name = bucket_name
         self.region = region
-        self.cache_dir = tempfile.mkdtemp(prefix='docspectra_models_')
+        # Use persistent cache under user's cache directory instead of tmp
+        default_cache = os.path.join(os.path.expanduser("~"), ".cache", "docspectra", "marker_models")
+        self.cache_dir = os.getenv("DOCSPECTRA_MODEL_CACHE", default_cache)
+        os.makedirs(self.cache_dir, exist_ok=True)
         self._cache_lock = threading.Lock()
         self._downloaded_models = set()
         
@@ -44,20 +47,29 @@ class S3ModelManager:
             'texify': 'TEXIFY_MODEL_CHECKPOINT'
         }
         
-        logger.info(f"Initialized S3ModelManager with temp dir: {self.cache_dir}")
+        logger.info(f"Initialized S3ModelManager with cache dir: {self.cache_dir}")
     
     def _download_model_from_s3(self, model_name: str) -> str:
-        """Download model from S3 to local cache"""
+        """Download model from S3 to local cache if not already present"""
         local_model_path = os.path.join(self.cache_dir, model_name)
         s3_prefix = f"docspectra_models/{model_name}/"
         
+        # If already marked downloaded in this process, reuse
         if model_name in self._downloaded_models:
-            logger.info(f"Model {model_name} already cached locally")
+            logger.info(f"Model {model_name} already cached locally (session)")
             return local_model_path
         
-        logger.info(f"Downloading {model_name} from S3 to {local_model_path}")
+        # If directory exists and is non-empty, assume cached and reuse
+        if os.path.isdir(local_model_path):
+            try:
+                if any(os.scandir(local_model_path)):
+                    logger.info(f"Model {model_name} found in persistent cache: {local_model_path}")
+                    self._downloaded_models.add(model_name)
+                    return local_model_path
+            except Exception:
+                pass
         
-        # Create local directory
+        logger.info(f"Downloading {model_name} from S3 to {local_model_path}")
         os.makedirs(local_model_path, exist_ok=True)
         
         try:
@@ -73,17 +85,11 @@ class S3ModelManager:
             # Download all model files
             for obj in response['Contents']:
                 s3_key = obj['Key']
-                if s3_key.endswith('/'):  # Skip directory markers
+                if s3_key.endswith('/'):
                     continue
-                
-                # Calculate local file path
                 relative_path = s3_key[len(s3_prefix):]
                 local_file_path = os.path.join(local_model_path, relative_path)
-                
-                # Create subdirectories if needed
                 os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-                
-                # Download file
                 self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
                 logger.debug(f"Downloaded {s3_key} -> {local_file_path}")
             
@@ -92,7 +98,7 @@ class S3ModelManager:
             return local_model_path
             
         except ClientError as e:
-            logger.error(f"Error downloading {model_name}: {str(e)}")
+            logger.error(f"Failed downloading {model_name} from S3: {e}")
             raise
     
     def setup_model_environment(self, models_to_load: Optional[List[str]] = None):
@@ -106,20 +112,15 @@ class S3ModelManager:
                 continue
             
             try:
-                # Download model and get local path
                 local_path = self._download_model_from_s3(model_name)
-                
-                # Set environment variable for marker
                 env_var = self.model_mappings[model_name]
                 os.environ[env_var] = local_path
-                
                 logger.info(f"Set {env_var} = {local_path}")
-                
             except Exception as e:
                 logger.error(f"Failed to setup {model_name}: {str(e)}")
                 raise
         
-        # Set cache directory for additional models
+        # Set cache directory for additional models to persistent cache
         os.environ['MODEL_CACHE_DIR'] = self.cache_dir
         logger.info(f"Set MODEL_CACHE_DIR = {self.cache_dir}")
     
@@ -331,13 +332,14 @@ class MarkerHandlerWithS3Models:
 
     def _setup_marker_environment(self):
         """Setup environment for optimal Marker performance"""
-        # Setup models from S3
+        # Setup models from S3 into persistent cache
         self.model_manager.setup_model_environment()
         
         # Additional Marker configuration
         os.environ.setdefault("TORCH_DEVICE", "cuda" if self._has_gpu() else "cpu")
+        # Tuning flags for performance; adjust as needed
         os.environ.setdefault("OCR_ENGINE", "surya")
-        os.environ.setdefault("EXTRACT_IMAGES", "true")
+        os.environ.setdefault("EXTRACT_IMAGES", "false")  # disable image extraction for speed
         
         if self.batch_multiplier > 1:
             os.environ["BATCH_MULTIPLIER"] = str(self.batch_multiplier)
@@ -721,7 +723,7 @@ class MarkerS3Context:
         self.handler = MarkerHandlerWithS3Models(
             model_bucket=bucket_name,
             aws_region=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'),
-            use_llm=False,  # Set to True for enhanced PDF processing accuracy
+            use_llm=False,
             batch_multiplier=1,
             use_bedrock_qa=use_bedrock_qa
         )
@@ -730,4 +732,5 @@ class MarkerS3Context:
         return self.handler
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.handler.cleanup_temp_documents()  # Only clean up temp documents after each query
+        # Only clean temporary documents, keep persistent model cache intact
+        self.handler.cleanup_temp_documents()
