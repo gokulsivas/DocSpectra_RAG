@@ -440,7 +440,7 @@ class MarkerHandlerWithS3Models:
             return False
 
     def _ensure_models_loaded(self):
-        """Load Marker models with S3-downloaded model checkpoints (optimized)"""
+        """Load Marker models with S3-downloaded model checkpoints (FORCED optimization)"""
         if not self._models_loaded:
             with self._cache_lock:
                 if not self._models_loaded:  # Double-check locking
@@ -452,58 +452,89 @@ class MarkerHandlerWithS3Models:
                         logger.info("Marker models already initialized in process (reusing shared models)")
                         return
 
-                    logger.info("Setting up optimized Marker models (using persistent cache if available)...")
+                    logger.info("Setting up FORCED optimized Marker models...")
                     
                     # Setup environment with S3 models (optimized set)
                     self._setup_marker_environment()
                     
+                    # FORCE: Remove layout detection model from environment if it exists
+                    layout_env_vars = [
+                        'LAYOUT_MODEL_CHECKPOINT',
+                        'LAYOUT_DETECTION_MODEL',
+                        'LAYOUT_MODEL_PATH'
+                    ]
+                    for env_var in layout_env_vars:
+                        if env_var in os.environ:
+                            del os.environ[env_var]
+                            logger.info(f"🚫 Removed {env_var} from environment")
+                    
                     # Create model dictionary with our S3 models (loaded from local cache paths)
                     self._model_dict = create_model_dict()
                     
-                    # FIX: Configure Marker with proper string format for processors
+                    # FORCE: Remove layout detection from model_dict if it exists
+                    if 'layout' in self._model_dict:
+                        del self._model_dict['layout']
+                        logger.info("🚫 Removed layout model from model_dict")
+                    
+                    # FORCE: Minimal config - don't specify anything that could trigger layout detection
                     config = {
                         "output_format": "markdown",
-                        "extract_images": False,
-                        "disable_layout_detection": True,  # Explicitly disable
-                        "optimize_for_cpu": True,
-                        "use_optimized_pipeline": True
-                        # DON'T specify processors list - let Marker use defaults based on available models
+                        "extract_images": False
+                        # Remove all optimization flags that might be ignored
                     }
                     
-                    if self.use_llm:
-                        config["use_llm"] = True
-                        config["llm_model"] = "gemini-2.0-flash"
-                    
-                    logger.info(f"Creating config parser with config: {config}")
+                    logger.info(f"Creating MINIMAL config: {config}")
                     config_parser = ConfigParser(config)
                     
-                    # DEBUG: Log what processors are being used
+                    # FORCE: Create custom processor list excluding layout detection
                     try:
-                        processors = config_parser.get_processors()
-                        logger.info(f"Processors from config_parser: {processors}")
-                    except Exception as proc_error:
-                        logger.error(f"Error getting processors: {proc_error}")
-                        # Fallback: don't specify processors, let Marker decide
-                        processors = None
-                    
-                    # Initialize converter with optimized configuration
-                    try:
+                        # Get available processors but filter out layout-related ones
+                        available_processors = []
+                        
+                        # Only add processors for models we actually have
+                        if 'DETECTOR_MODEL_CHECKPOINT' in os.environ:
+                            available_processors.append('text_detection')
+                        if 'RECOGNITION_MODEL_CHECKPOINT' in os.environ:
+                            available_processors.append('text_recognition')
+                        if 'READING_ORDER_MODEL_CHECKPOINT' in os.environ:
+                            available_processors.append('reading_order')
+                        if 'TABLE_REC_MODEL_CHECKPOINT' in os.environ:
+                            available_processors.append('table_recognition')
+                        if 'TEXIFY_MODEL_CHECKPOINT' in os.environ:
+                            available_processors.append('texify')
+                        
+                        logger.info(f"🎯 FORCED processor list: {available_processors}")
+                        
+                        # Initialize converter with EXPLICIT processor control
                         self._converter = PdfConverter(
                             config=config_parser.generate_config_dict(),
                             artifact_dict=self._model_dict,
-                            processor_list=processors,  # Let this be None if there was an error
-                            renderer=config_parser.get_renderer(),
-                            llm_service=config_parser.get_llm_service() if self.use_llm else None
-                        )
-                    except Exception as converter_error:
-                        logger.error(f"Error creating PdfConverter: {converter_error}")
-                        # Try simpler initialization without processor_list
-                        logger.info("Trying simpler PdfConverter initialization...")
-                        self._converter = PdfConverter(
-                            config=config_parser.generate_config_dict(),
-                            artifact_dict=self._model_dict,
+                            # Don't use config_parser.get_processors() - it might include layout
+                            processor_list=available_processors,  # Use our custom list
                             renderer=config_parser.get_renderer()
                         )
+                        
+                    except Exception as converter_error:
+                        logger.error(f"Error creating PdfConverter with custom processors: {converter_error}")
+                        
+                        # Ultra-fallback: Try with minimal setup
+                        try:
+                            logger.info("🔧 Trying ultra-minimal PdfConverter setup...")
+                            
+                            # Create an even more basic model dict with only essential models
+                            minimal_model_dict = {}
+                            for key in ['text_detection', 'text_recognition']:
+                                if key in self._model_dict:
+                                    minimal_model_dict[key] = self._model_dict[key]
+                            
+                            self._converter = PdfConverter(
+                                config={"output_format": "markdown", "extract_images": False},
+                                artifact_dict=minimal_model_dict
+                            )
+                            
+                        except Exception as final_error:
+                            logger.error(f"Even minimal PdfConverter failed: {final_error}")
+                            raise
                     
                     # Mark as loaded and store in shared cache
                     self._models_loaded = True
@@ -511,8 +542,8 @@ class MarkerHandlerWithS3Models:
                     _SHARED_MODELS["model_dict"] = self._model_dict
                     _SHARED_MODELS["converter"] = self._converter
                     
-                    logger.info("✅ Optimized Marker models initialized successfully")
-                    logger.info("✅ Layout detection disabled - processing will be faster")
+                    logger.info("✅ FORCED optimized Marker models initialized")
+                    logger.info("🚫 Layout detection FORCIBLY disabled")
 
     def convert_pdf_to_markdown(self, pdf_path: str, **kwargs) -> Tuple[str, Dict, List]:
         """Convert PDF to markdown using S3 models with optional page controls
