@@ -7,8 +7,7 @@ from typing import Optional
 class AWSConfig:
     """AWS configuration with Titan support"""
     region: str = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-    s3_bucket: str = os.getenv('MARKER_S3_BUCKET', '')
-    titan_model_id: str = os.getenv('TITAN_MODEL_ID', 'amazon.titan-text-express-v1:0')
+    titan_model_id: str = os.getenv('TITAN_MODEL_ID', 'amazon.titan-text-express-v1')
     titan_embed_model: str = os.getenv('TITAN_EMBED_MODEL', 'amazon.titan-embed-text-v1')
     temperature: float = float(os.getenv('TEMPERATURE', '0.3'))
     top_p: float = float(os.getenv('TOP_P', '0.9'))
@@ -23,8 +22,8 @@ class PineconeConfig:
     """Pinecone configuration"""
     api_key: str = os.getenv('PINECONE_API_KEY', '')
     index_name: str = os.getenv('PINECONE_INDEX_NAME', 'docspectra-index')
-    environment: str = os.getenv('PINECONE_ENV', 'us-east-1')  # Changed from PINECONE_ENVIRONMENT
-    dimension: int = int(os.getenv('PINECONE_DIMENSION', '1536'))  # Added missing dimension field
+    environment: str = os.getenv('PINECONE_ENV', 'us-east-1')
+    dimension: int = int(os.getenv('PINECONE_DIMENSION', '1536'))
 
 @dataclass
 class ProcessingConfig:
@@ -34,16 +33,22 @@ class ProcessingConfig:
     chunk_max_words: int = int(os.getenv('CHUNK_MAX_WORDS', '150'))
     top_k_retrieval: int = int(os.getenv('TOP_K_RETRIEVAL', '5'))
 
-# Global config instances - MAKE SURE these are created
+@dataclass
+class OCRConfig:
+    """OCR configuration"""
+    tesseract_cmd: str = os.getenv('TESSERACT_CMD', 'tesseract')
+    ocr_lang: str = os.getenv('OCR_LANG', 'eng')
+    dpi: int = int(os.getenv('OCR_DPI', '300'))
+    timeout: int = int(os.getenv('OCR_TIMEOUT', '60'))
+
+# Global config instances
 aws_config = AWSConfig()
 pinecone_config = PineconeConfig()
 processing_config = ProcessingConfig()
+ocr_config = OCRConfig()
 
-# Add validation function that can be called when needed
+# Add validation function
 def validate_config():
     """Validate that required environment variables are set"""
     if not pinecone_config.api_key:
         raise ValueError("PINECONE_API_KEY environment variable is required")
-    
-    if not aws_config.s3_bucket:
-        raise ValueError("MARKER_S3_BUCKET environment variable is required")

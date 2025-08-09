@@ -1,12 +1,11 @@
-# app/utils/document_processor.py - RAG with Vector DB
+# app/utils/document_processor.py - RAG with Vector DB using PDF processor
 import logging
 from typing import List, Dict, Any, Optional
-from .marker_handler import MarkerS3Context
+from .pdf_processor import PDFProcessor
 from .chunker import TextChunker
 from .embedder import DocumentEmbedder
 from .vector_store import VectorStore
 from .answer_generator import AnswerGenerator
-from ..config import aws_config
 
 logger = logging.getLogger(__name__)
 
@@ -15,18 +14,18 @@ class DocumentProcessor:
     
     def __init__(self):
         """Initialize document processor with required components"""
+        self.pdf_processor = PDFProcessor()
         self.chunker = TextChunker()
         self.embedder = DocumentEmbedder()
         self.vector_store = VectorStore()
         self.answer_generator = AnswerGenerator()
-        self.s3_bucket = aws_config.s3_bucket
         
-        logger.info("DocumentProcessor initialized with RAG pipeline")
+        logger.info("DocumentProcessor initialized with PDF + OCR pipeline")
     
     def process_document_qa(self, document_url: str, questions: List[str]) -> Dict[str, Any]:
         """
         Complete RAG document processing pipeline:
-        1. Marker scans document and extracts text
+        1. PyPDF/OCR extracts text from PDF
         2. Chunk text and store in vectorDB (Pinecone)
         3. For each question: Search Vector DB for relevant chunks
         4. Use Titan LLM with relevant chunks to generate answers
@@ -36,18 +35,18 @@ class DocumentProcessor:
             logger.info(f"Processing document: {document_url}")
             logger.info(f"Questions: {len(questions)}")
             
-            # Step 1: Process document with Marker to get OCR text
-            with MarkerS3Context(self.s3_bucket, use_bedrock_qa=False) as marker_handler:
-                doc_result = marker_handler.process_document_from_url(document_url)
-                
-                if not doc_result['success']:
-                    return {
-                        'success': False,
-                        'error': f"Document processing failed: {doc_result.get('error', 'Unknown error')}"
-                    }
-                
-                document_text = doc_result['text']
-                logger.info(f"Document processed successfully: {len(document_text)} characters")
+            # Step 1: Process document with PDF processor
+            doc_result = self.pdf_processor.process_document_from_url(document_url)
+            
+            if not doc_result['success']:
+                return {
+                    'success': False,
+                    'error': f"Document processing failed: {doc_result.get('error', 'Unknown error')}"
+                }
+            
+            document_text = doc_result['text']
+            extraction_method = doc_result.get('method', 'unknown')
+            logger.info(f"Document processed successfully using {extraction_method}: {len(document_text)} characters")
             
             # Step 2: Chunk the document for vector search
             chunks = self.chunker.chunk_text(document_text)
@@ -102,6 +101,8 @@ class DocumentProcessor:
                 'answers': answers,
                 'metadata': {
                     'document_length': len(document_text),
+                    'extraction_method': extraction_method,
+                    'pages_processed': doc_result.get('pages_processed', 0),
                     'chunks_created': len(chunks),
                     'chunks_stored': len(embedded_chunks),
                     'questions_processed': len(questions),
@@ -121,13 +122,18 @@ class DocumentProcessor:
     def health_check(self) -> Dict[str, Any]:
         """Check system health"""
         try:
+            # Check PDF processor health
+            pdf_health = self.pdf_processor.health_check()
+            
             # Check vector store health
             vector_health = self.vector_store.health_check()
             
             return {
-                "status": "healthy" if vector_health["status"] in ["healthy", "index_missing"] else "unhealthy",
+                "status": "healthy" if (pdf_health["status"] == "healthy" and 
+                                     vector_health["status"] in ["healthy", "index_missing"]) else "unhealthy",
+                "pdf_processor": pdf_health,
                 "vector_store": vector_health,
-                "pinecone": "connected" if vector_health["pinecone_connected"] else "disconnected"
+                "pinecone": "connected" if vector_health.get("pinecone_connected") else "disconnected"
             }
         except Exception as e:
             logger.error(f"Health check failed: {e}")
