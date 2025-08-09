@@ -485,10 +485,11 @@ class MarkerHandlerWithS3Models:
                         # Use default processors - let Marker handle the initialization
                         logger.info("Creating PdfConverter with default configuration...")
                         
-                        # Create minimal config
+                        # Create minimal config that ACTUALLY disables layout detection
                         config = {
                             "output_format": "markdown",
-                            "extract_images": False
+                            "extract_images": False,
+                            "force_layout_block": "Text"  # This actually disables layout detection
                         }
                         
                         logger.info(f"Creating MINIMAL config: {config}")
