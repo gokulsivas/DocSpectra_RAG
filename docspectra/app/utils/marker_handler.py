@@ -623,15 +623,28 @@ class MarkerHandlerWithS3Models:
                 markdown_parts: List[str] = []
                 all_images: List[Any] = []
                 combined_meta: Dict[str, Any] = {"batches": []}
+                
                 for batch_start in range(s, e+1, page_batch_size):
                     batch_end = min(e, batch_start + page_batch_size - 1)
                     subset_path = _subset(pdf_path, batch_start, batch_end)
+                    
+                    logger.info(f"Processing batch {batch_start}-{batch_end}")
                     rendered = self._converter(subset_path)
                     md, meta, images = text_from_rendered(rendered)
+                    
+                    # FIX: Handle case where md might be a list
+                    if isinstance(md, list):
+                        logger.info("Markdown returned as list, joining...")
+                        md = '\n\n'.join(str(item) for item in md)
+                    elif not isinstance(md, str):
+                        logger.warning(f"Markdown is unexpected type {type(md)}, converting...")
+                        md = str(md)
+                    
                     markdown_parts.append(md)
                     combined_meta["batches"].append({"start": batch_start, "end": batch_end, "meta": meta})
                     if images:
                         all_images.extend(images)
+                        
                 markdown_text = "\n\n\n".join(markdown_parts)
                 metadata = combined_meta
                 images = all_images
@@ -651,13 +664,51 @@ class MarkerHandlerWithS3Models:
                 run_path = _subset(pdf_path, s, e)
 
             # Convert PDF using Marker with S3 models
+            logger.info("Converting PDF with Marker...")
             rendered = self._converter(run_path)
-            markdown_text, metadata, images = text_from_rendered(rendered)
+            logger.info(f"Marker conversion complete, extracting text...")
             
-            return markdown_text, metadata, images
-            
+            # FIX: Add debug logging and handle different return types
+            try:
+                result = text_from_rendered(rendered)
+                logger.info(f"text_from_rendered returned: {type(result)}")
+                
+                if isinstance(result, tuple) and len(result) >= 3:
+                    markdown_text, metadata, images = result[0], result[1], result[2]
+                elif isinstance(result, tuple) and len(result) == 2:
+                    markdown_text, metadata = result[0], result[1]
+                    images = []
+                elif isinstance(result, str):
+                    markdown_text, metadata, images = result, {}, []
+                else:
+                    logger.error(f"Unexpected result type from text_from_rendered: {type(result)}")
+                    logger.error(f"Result content: {result}")
+                    raise ValueError(f"Unexpected result type from text_from_rendered: {type(result)}")
+                
+                # FIX: Handle case where markdown_text might be a list
+                if isinstance(markdown_text, list):
+                    logger.info("Markdown text returned as list, joining...")
+                    markdown_text = '\n\n'.join(str(item) for item in markdown_text)
+                elif not isinstance(markdown_text, str):
+                    logger.warning(f"Markdown text is unexpected type {type(markdown_text)}, converting...")
+                    markdown_text = str(markdown_text)
+                
+                logger.info(f"Final markdown text type: {type(markdown_text)}")
+                logger.info(f"Final markdown length: {len(markdown_text)} characters")
+                logger.info(f"Markdown preview: {markdown_text[:200]}...")
+                
+                return markdown_text, metadata, images
+                
+            except Exception as text_extract_error:
+                logger.error(f"Error in text_from_rendered: {text_extract_error}")
+                logger.error(f"Rendered type: {type(rendered)}")
+                raise
+                
         except Exception as e:
             logger.error(f"Error converting PDF: {str(e)}")
+            logger.error(f"Error type: {type(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
 
     def process_document_from_url(self, 
