@@ -11,12 +11,12 @@ router = APIRouter()
 _processor = None
 
 def get_processor():
-    """Get or create FastDocumentProcessor instance"""
+    """Get or create ImprovedFastDocumentProcessor instance"""
     global _processor
     if _processor is None:
-        from .utils.fast_document_processor import FastDocumentProcessor
-        _processor = FastDocumentProcessor()
-        logger.info("✅ FastDocumentProcessor initialized successfully")
+        from .utils.improved_fast_document_processor import ImprovedFastDocumentProcessor
+        _processor = ImprovedFastDocumentProcessor()
+        logger.info("✅ ImprovedFastDocumentProcessor initialized successfully")
     return _processor
 
 # ✅ Updated models to match HackRx API format
