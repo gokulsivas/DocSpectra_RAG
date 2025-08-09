@@ -460,38 +460,50 @@ class MarkerHandlerWithS3Models:
                     # Create model dictionary with our S3 models (loaded from local cache paths)
                     self._model_dict = create_model_dict()
                     
-                    # Configure Marker with optimizations
-                    # Configure Marker with optimizations - MORE EXPLICIT
+                    # FIX: Configure Marker with proper string format for processors
                     config = {
                         "output_format": "markdown",
                         "extract_images": False,
                         "disable_layout_detection": True,  # Explicitly disable
-                        "layout_model": None,              # Don't load layout model
                         "optimize_for_cpu": True,
-                        "use_optimized_pipeline": True,
-                        "processors": [                    # Explicitly define which processors to use
-                            "text_detection",
-                            "text_recognition", 
-                            "reading_order",
-                            "table_recognition",
-                            "texify"
-                        ]
+                        "use_optimized_pipeline": True
+                        # DON'T specify processors list - let Marker use defaults based on available models
                     }
-                                        
+                    
                     if self.use_llm:
                         config["use_llm"] = True
                         config["llm_model"] = "gemini-2.0-flash"
                     
+                    logger.info(f"Creating config parser with config: {config}")
                     config_parser = ConfigParser(config)
                     
+                    # DEBUG: Log what processors are being used
+                    try:
+                        processors = config_parser.get_processors()
+                        logger.info(f"Processors from config_parser: {processors}")
+                    except Exception as proc_error:
+                        logger.error(f"Error getting processors: {proc_error}")
+                        # Fallback: don't specify processors, let Marker decide
+                        processors = None
+                    
                     # Initialize converter with optimized configuration
-                    self._converter = PdfConverter(
-                        config=config_parser.generate_config_dict(),
-                        artifact_dict=self._model_dict,
-                        processor_list=config_parser.get_processors(),
-                        renderer=config_parser.get_renderer(),
-                        llm_service=config_parser.get_llm_service() if self.use_llm else None
-                    )
+                    try:
+                        self._converter = PdfConverter(
+                            config=config_parser.generate_config_dict(),
+                            artifact_dict=self._model_dict,
+                            processor_list=processors,  # Let this be None if there was an error
+                            renderer=config_parser.get_renderer(),
+                            llm_service=config_parser.get_llm_service() if self.use_llm else None
+                        )
+                    except Exception as converter_error:
+                        logger.error(f"Error creating PdfConverter: {converter_error}")
+                        # Try simpler initialization without processor_list
+                        logger.info("Trying simpler PdfConverter initialization...")
+                        self._converter = PdfConverter(
+                            config=config_parser.generate_config_dict(),
+                            artifact_dict=self._model_dict,
+                            renderer=config_parser.get_renderer()
+                        )
                     
                     # Mark as loaded and store in shared cache
                     self._models_loaded = True
@@ -501,82 +513,6 @@ class MarkerHandlerWithS3Models:
                     
                     logger.info("✅ Optimized Marker models initialized successfully")
                     logger.info("✅ Layout detection disabled - processing will be faster")
-
-    def download_document_from_url(self, url: str) -> str:
-        """Download document from URL to temporary local file"""
-        try:
-            # Validate URL
-            parsed_url = urlparse(url)
-            if not parsed_url.scheme or not parsed_url.netloc:
-                raise ValueError(f"Invalid URL format: {url}")
-            
-            logger.info(f"Downloading document from URL: {url}")
-            
-            # Configure session
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': 'MarkerS3Models/1.0 (Document Processing)',
-                'Accept': 'application/pdf,application/octet-stream,*/*'
-            })
-            
-            # Download with streaming
-            response = session.get(url, timeout=self.download_timeout, stream=True)
-            response.raise_for_status()
-            
-            # Determine file extension
-            content_type = response.headers.get('content-type', '').lower()
-            file_extension = '.pdf'  # Default
-            
-            if 'pdf' in content_type:
-                file_extension = '.pdf'
-            else:
-                url_path = parsed_url.path
-                if url_path:
-                    _, ext = os.path.splitext(url_path)
-                    if ext.lower() in ['.pdf', '.doc', '.docx']:
-                        file_extension = ext.lower()
-            
-            # Create temporary file
-            temp_file = tempfile.NamedTemporaryFile(
-                dir=self.document_cache_dir,
-                suffix=file_extension,
-                delete=False
-            )
-            
-            # Download in chunks
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded_size = 0
-            
-            with temp_file as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        
-                        if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
-                            progress = (downloaded_size / total_size) * 100
-                            logger.debug(f"Download progress: {progress:.1f}%")
-            
-            # Validate file
-            file_size = os.path.getsize(temp_file.name)
-            if file_size == 0:
-                os.unlink(temp_file.name)
-                raise ValueError("Downloaded file is empty")
-            
-            # Basic PDF validation
-            if file_extension == '.pdf':
-                with open(temp_file.name, 'rb') as f:
-                    header = f.read(4)
-                    if header != b'%PDF':
-                        logger.warning("Downloaded file may not be a valid PDF")
-            
-            self._temp_files.add(temp_file.name)
-            logger.info(f"Successfully downloaded to: {temp_file.name}")
-            return temp_file.name
-            
-        except Exception as e:
-            logger.error(f"Error downloading from {url}: {str(e)}")
-            raise
 
     def convert_pdf_to_markdown(self, pdf_path: str, **kwargs) -> Tuple[str, Dict, List]:
         """Convert PDF to markdown using S3 models with optional page controls
