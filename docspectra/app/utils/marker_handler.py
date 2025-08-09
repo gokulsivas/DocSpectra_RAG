@@ -711,6 +711,82 @@ class MarkerHandlerWithS3Models:
         
         return qa_results
 
+    def download_document_from_url(self, url: str) -> str:
+        """Download document from URL to temporary local file"""
+        try:
+            # Validate URL
+            parsed_url = urlparse(url)
+            if not parsed_url.scheme or not parsed_url.netloc:
+                raise ValueError(f"Invalid URL format: {url}")
+            
+            logger.info(f"Downloading document from URL: {url}")
+            
+            # Configure session
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'MarkerS3Models/1.0 (Document Processing)',
+                'Accept': 'application/pdf,application/octet-stream,*/*'
+            })
+            
+            # Download with streaming
+            response = session.get(url, timeout=self.download_timeout, stream=True)
+            response.raise_for_status()
+            
+            # Determine file extension
+            content_type = response.headers.get('content-type', '').lower()
+            file_extension = '.pdf'  # Default
+            
+            if 'pdf' in content_type:
+                file_extension = '.pdf'
+            else:
+                url_path = parsed_url.path
+                if url_path:
+                    _, ext = os.path.splitext(url_path)
+                    if ext.lower() in ['.pdf', '.doc', '.docx']:
+                        file_extension = ext.lower()
+            
+            # Create temporary file
+            temp_file = tempfile.NamedTemporaryFile(
+                dir=self.document_cache_dir,
+                suffix=file_extension,
+                delete=False
+            )
+            
+            # Download in chunks
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded_size = 0
+            
+            with temp_file as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+                        if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
+                            progress = (downloaded_size / total_size) * 100
+                            logger.debug(f"Download progress: {progress:.1f}%")
+            
+            # Validate file
+            file_size = os.path.getsize(temp_file.name)
+            if file_size == 0:
+                os.unlink(temp_file.name)
+                raise ValueError("Downloaded file is empty")
+            
+            # Basic PDF validation
+            if file_extension == '.pdf':
+                with open(temp_file.name, 'rb') as f:
+                    header = f.read(4)
+                    if header != b'%PDF':
+                        logger.warning("Downloaded file may not be a valid PDF")
+            
+            self._temp_files.add(temp_file.name)
+            logger.info(f"Successfully downloaded to: {temp_file.name}")
+            return temp_file.name
+            
+        except Exception as e:
+            logger.error(f"Error downloading from {url}: {str(e)}")
+            raise
+        
     def _find_answer_in_text(self, question: str, sentences: List[str], full_document_text: str, context_window: int = 3) -> str:
         """
         Enhanced answer finding with Bedrock Titan integration.
