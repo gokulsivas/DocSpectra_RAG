@@ -1,7 +1,8 @@
-# app/utils/pdf_processor.py - PDF processing with PyPDF + Tesseract
+# app/utils/pdf_processor.py - PDF processing with improved error handling
 import logging
 import tempfile
 import os
+import shutil
 from typing import Dict, Any, Optional
 from pathlib import Path
 import requests
@@ -9,7 +10,6 @@ from urllib.parse import urlparse
 
 from pypdf import PdfReader
 import pytesseract
-from pdf2image import convert_from_path
 from PIL import Image
 import numpy as np
 
@@ -18,7 +18,7 @@ from ..config import ocr_config
 logger = logging.getLogger(__name__)
 
 class PDFProcessor:
-    """PDF processor using PyPDF and Tesseract OCR"""
+    """PDF processor using PyPDF and Tesseract OCR with improved error handling"""
     
     def __init__(self):
         self.tesseract_cmd = ocr_config.tesseract_cmd
@@ -30,8 +30,27 @@ class PDFProcessor:
         if self.tesseract_cmd != 'tesseract':
             pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
         
+        # Check if poppler is available
+        self.poppler_available = self._check_poppler_availability()
+        
         logger.info(f"PDFProcessor initialized with Tesseract: {self.tesseract_cmd}")
         logger.info(f"OCR language: {self.ocr_lang}, DPI: {self.dpi}")
+        logger.info(f"Poppler available: {self.poppler_available}")
+    
+    def _check_poppler_availability(self) -> bool:
+        """Check if poppler is available in the system"""
+        try:
+            # Check for pdftoppm (part of poppler-utils)
+            result = shutil.which('pdftoppm')
+            if result:
+                logger.info(f"Found poppler at: {result}")
+                return True
+            else:
+                logger.warning("Poppler not found in PATH. OCR functionality will be limited.")
+                return False
+        except Exception as e:
+            logger.warning(f"Error checking poppler availability: {e}")
+            return False
     
     def download_pdf_from_url(self, url: str) -> str:
         """Download PDF from URL to temporary file"""
@@ -84,7 +103,7 @@ class PDFProcessor:
             raise
     
     def extract_text_from_pdf(self, pdf_path: str) -> Dict[str, Any]:
-        """Extract text from PDF using PyPDF first, then OCR if needed"""
+        """Extract text from PDF using PyPDF first, then OCR if needed and available"""
         try:
             logger.info(f"Processing PDF: {pdf_path}")
             
@@ -101,25 +120,40 @@ class PDFProcessor:
                     'pages_processed': self._count_pdf_pages(pdf_path)
                 }
             
-            # If PyPDF didn't work well, try OCR
-            logger.info("PyPDF extraction insufficient, trying OCR...")
-            ocr_content = self._extract_text_ocr(pdf_path)
+            # If PyPDF didn't work well, try OCR (if available)
+            if self.poppler_available:
+                logger.info("PyPDF extraction insufficient, trying OCR...")
+                ocr_content = self._extract_text_ocr(pdf_path)
+                
+                if ocr_content and len(ocr_content.strip()) > 50:
+                    logger.info(f"Extracted text using OCR: {len(ocr_content)} characters")
+                    return {
+                        'success': True,
+                        'text': ocr_content,
+                        'method': 'ocr',
+                        'pages_processed': self._count_pdf_pages(pdf_path)
+                    }
+            else:
+                logger.warning("OCR fallback not available - poppler not installed")
             
-            if ocr_content and len(ocr_content.strip()) > 50:
-                logger.info(f"Extracted text using OCR: {len(ocr_content)} characters")
+            # If we have some text from PyPDF (even if minimal), use it
+            if text_content and len(text_content.strip()) > 10:
+                logger.info(f"Using minimal PyPDF text: {len(text_content)} characters")
                 return {
                     'success': True,
-                    'text': ocr_content,
-                    'method': 'ocr',
-                    'pages_processed': self._count_pdf_pages(pdf_path)
+                    'text': text_content,
+                    'method': 'pypdf_minimal',
+                    'pages_processed': self._count_pdf_pages(pdf_path),
+                    'warning': 'Limited text extracted, consider installing poppler for better OCR support'
                 }
             
-            # If both methods failed
+            # If both methods failed or unavailable
             return {
                 'success': False,
-                'error': 'Could not extract meaningful text from PDF',
-                'text': text_content or ocr_content or '',
-                'method': 'failed'
+                'error': 'Could not extract meaningful text from PDF. Install poppler-utils for better OCR support.',
+                'text': text_content or '',
+                'method': 'failed',
+                'suggestion': 'Install poppler: sudo apt-get install poppler-utils (Ubuntu) or brew install poppler (macOS)'
             }
             
         except Exception as e:
@@ -156,8 +190,15 @@ class PDFProcessor:
             return ''
     
     def _extract_text_ocr(self, pdf_path: str) -> str:
-        """Extract text using Tesseract OCR"""
+        """Extract text using Tesseract OCR - only if poppler is available"""
+        if not self.poppler_available:
+            logger.warning("OCR extraction skipped - poppler not available")
+            return ''
+        
         try:
+            # Import pdf2image here so it's only imported when needed
+            from pdf2image import convert_from_path
+            
             logger.info("Converting PDF to images for OCR...")
             
             # Convert PDF to images
@@ -200,6 +241,9 @@ class PDFProcessor:
             
             return '\n\n'.join(text_content)
             
+        except ImportError:
+            logger.error("pdf2image not installed. Install with: pip install pdf2image")
+            return ''
         except Exception as e:
             logger.error(f"OCR extraction error: {e}")
             return ''
@@ -226,18 +270,18 @@ class PDFProcessor:
             return image
     
     def _has_meaningful_text(self, text: str) -> bool:
-        """Check if extracted text is meaningful"""
-        if not text or len(text.strip()) < 50:
+        """Check if extracted text is meaningful - more lenient for single pages"""
+        if not text or len(text.strip()) < 20:  # Reduced from 50 for single pages
             return False
         
-        # Check for reasonable word count
+        # Check for reasonable word count - more lenient
         words = text.split()
-        if len(words) < 10:
+        if len(words) < 5:  # Reduced from 10
             return False
         
-        # Check for reasonable character distribution
+        # Check for reasonable character distribution - more lenient
         alpha_chars = sum(1 for c in text if c.isalpha())
-        if alpha_chars / len(text) < 0.3:  # Less than 30% alphabetic characters
+        if len(text) > 0 and alpha_chars / len(text) < 0.2:  # Reduced from 0.3
             return False
         
         return True
@@ -246,7 +290,7 @@ class PDFProcessor:
         """Count pages in PDF"""
         try:
             with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = PdfReader(file)
                 return len(pdf_reader.pages)
         except Exception:
             return 0
@@ -282,7 +326,7 @@ class PDFProcessor:
                     logger.warning(f"Failed to clean up temp file {temp_path}: {e}")
     
     def health_check(self) -> Dict[str, Any]:
-        """Check if OCR system is working"""
+        """Check if PDF processing system is working"""
         try:
             # Test Tesseract
             test_image = Image.new('RGB', (100, 50), color='white')
@@ -293,7 +337,10 @@ class PDFProcessor:
                 'tesseract_cmd': self.tesseract_cmd,
                 'ocr_lang': self.ocr_lang,
                 'tesseract_version': pytesseract.get_tesseract_version(),
-                'test_successful': True
+                'poppler_available': self.poppler_available,
+                'ocr_capable': self.poppler_available,
+                'test_successful': True,
+                'recommendation': 'Install poppler-utils for full OCR support' if not self.poppler_available else 'All components available'
             }
             
         except Exception as e:
@@ -301,5 +348,6 @@ class PDFProcessor:
                 'status': 'unhealthy',
                 'error': str(e),
                 'tesseract_cmd': self.tesseract_cmd,
+                'poppler_available': self.poppler_available,
                 'test_successful': False
             }
