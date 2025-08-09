@@ -23,7 +23,8 @@ class PineconeConfig:
     """Pinecone configuration"""
     api_key: str = os.getenv('PINECONE_API_KEY', '')
     index_name: str = os.getenv('PINECONE_INDEX_NAME', 'docspectra-index')
-    environment: str = os.getenv('PINECONE_ENVIRONMENT', 'gcp-starter')
+    environment: str = os.getenv('PINECONE_ENV', 'us-east-1')  # Changed from PINECONE_ENVIRONMENT
+    dimension: int = int(os.getenv('PINECONE_DIMENSION', '1536'))  # Added missing dimension field
 
 @dataclass
 class ProcessingConfig:

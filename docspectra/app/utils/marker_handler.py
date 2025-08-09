@@ -403,8 +403,14 @@ class MarkerHandlerWithS3Models:
     def _setup_marker_environment(self):
         """Setup environment for optimal Marker performance (without layout detection)"""
         # Setup models from S3 into persistent cache (optimized set)
+        logger.info("🔍 DEBUG: Checking environment variables before setup...")
+        logger.info(f"MARKER_DISABLE_LAYOUT_DETECTION = {os.getenv('MARKER_DISABLE_LAYOUT_DETECTION', 'NOT SET')}")
+    
         self.model_manager.setup_model_environment()
         
+        logger.info("🔍 DEBUG: Checking environment variables after setup...")
+        logger.info(f"MARKER_DISABLE_LAYOUT_DETECTION = {os.getenv('MARKER_DISABLE_LAYOUT_DETECTION', 'NOT SET')}")
+        logger.info(f"Available model env vars: {[k for k in os.environ.keys() if 'MODEL' in k]}")
         # Optimize for CPU-only execution
         _configure_cpu_runtime()
         
@@ -455,14 +461,23 @@ class MarkerHandlerWithS3Models:
                     self._model_dict = create_model_dict()
                     
                     # Configure Marker with optimizations
+                    # Configure Marker with optimizations - MORE EXPLICIT
                     config = {
                         "output_format": "markdown",
                         "extract_images": False,
                         "disable_layout_detection": True,  # Explicitly disable
+                        "layout_model": None,              # Don't load layout model
                         "optimize_for_cpu": True,
-                        "use_optimized_pipeline": True
+                        "use_optimized_pipeline": True,
+                        "processors": [                    # Explicitly define which processors to use
+                            "text_detection",
+                            "text_recognition", 
+                            "reading_order",
+                            "table_recognition",
+                            "texify"
+                        ]
                     }
-                    
+                                        
                     if self.use_llm:
                         config["use_llm"] = True
                         config["llm_model"] = "gemini-2.0-flash"
