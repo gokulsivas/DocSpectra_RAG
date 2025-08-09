@@ -1,24 +1,21 @@
-# app/utils/vector_store.py - FIXED for Pinecone SDK 3.x+
+# app/utils/vector_store.py - Enhanced search with better similarity
 import logging
 from typing import List, Dict, Any, Optional
 from pinecone import Pinecone, ServerlessSpec
-from ..config import pinecone_config, processing_config  # Both imports added
+from ..config import pinecone_config, processing_config
 from .embedder import DocumentEmbedder
 
 logger = logging.getLogger(__name__)
 
 class VectorStore:
-    """Enhanced vector store with Pinecone SDK 3.x+ compatibility"""
+    """Enhanced vector store with better search strategies"""
     
     def __init__(self):
         self.config = pinecone_config
         self.embedder = DocumentEmbedder()
-        
-        # FIXED: Initialize Pinecone client with v3+ API
         self.pc = Pinecone(api_key=self.config.api_key)
         self._index = None
-        
-        logger.info("Pinecone client initialized successfully")
+        logger.info("Enhanced Pinecone client initialized")
     
     @property 
     def index(self):
@@ -29,23 +26,17 @@ class VectorStore:
         return self._index
     
     def _ensure_index_exists(self):
-        """Create index if it doesn't exist - FIXED for Pinecone SDK 3.x+"""
+        """Create index if it doesn't exist"""
         try:
-            # Get list of existing indexes
             existing_indexes = self.pc.list_indexes().names()
             
             if self.config.index_name not in existing_indexes:
                 logger.info(f"Creating Pinecone index: {self.config.index_name}")
-                
-                # Create index with v3+ API
                 self.pc.create_index(
                     name=self.config.index_name,
-                    dimension=self.config.dimension,  # 1536 from your config
+                    dimension=self.config.dimension,
                     metric="cosine",
-                    spec=ServerlessSpec(
-                        cloud="aws",
-                        region=self.config.environment  # us-east-1 from your config
-                    )
+                    spec=ServerlessSpec(cloud="aws", region=self.config.environment)
                 )
                 logger.info(f"Successfully created index: {self.config.index_name}")
             else:
@@ -56,68 +47,106 @@ class VectorStore:
             raise
     
     def store_documents(self, documents: List[Dict[str, Any]]) -> bool:
-        """Store document embeddings in vector store"""
+        """Store document embeddings with enhanced metadata"""
         try:
             vectors_to_upsert = []
             
             for i, doc in enumerate(documents):
+                # Enhanced metadata for better retrieval
+                metadata = {
+                    "text": doc["text"][:2000],  # Increased metadata text limit
+                    "source": doc.get("source", "policy_document"),
+                    "chunk_id": doc.get("id", f"chunk_{i}"),
+                    "word_count": len(doc["text"].split()),
+                    "char_count": len(doc["text"])
+                }
+                
+                # Add section detection
+                text_lower = doc["text"].lower()
+                if any(keyword in text_lower for keyword in ["grace period", "premium", "payment"]):
+                    metadata["section_type"] = "payment_terms"
+                elif any(keyword in text_lower for keyword in ["waiting period", "pre-existing"]):
+                    metadata["section_type"] = "waiting_periods"
+                elif any(keyword in text_lower for keyword in ["maternity", "pregnancy"]):
+                    metadata["section_type"] = "maternity_coverage"
+                elif any(keyword in text_lower for keyword in ["definition", "means", "hospital"]):
+                    metadata["section_type"] = "definitions"
+                elif any(keyword in text_lower for keyword in ["benefit", "coverage", "cover"]):
+                    metadata["section_type"] = "benefits"
+                else:
+                    metadata["section_type"] = "general"
+                
                 vectors_to_upsert.append({
                     "id": doc.get("id", f"doc_{i}"),
                     "values": doc["embedding"],
-                    "metadata": {
-                        "text": doc["text"][:1000],  # Limit metadata text to avoid size issues
-                        "source": doc.get("source", "unknown")
-                    }
+                    "metadata": metadata
                 })
             
-            # Upsert in batches (Pinecone recommends batch size of 100)
+            # Upsert in batches
             batch_size = 100
-            total_batches = (len(vectors_to_upsert) + batch_size - 1) // batch_size
-            
             for i in range(0, len(vectors_to_upsert), batch_size):
                 batch = vectors_to_upsert[i:i + batch_size]
-                batch_num = (i // batch_size) + 1
-                
-                logger.info(f"Upserting batch {batch_num}/{total_batches} ({len(batch)} vectors)")
-                
-                # Use the v3+ upsert method
                 self.index.upsert(vectors=batch)
+                logger.info(f"Upserted batch {(i//batch_size)+1}/{(len(vectors_to_upsert)-1)//batch_size+1}")
                 
-            logger.info(f"Successfully stored {len(vectors_to_upsert)} documents in vector store")
+            logger.info(f"Successfully stored {len(vectors_to_upsert)} documents")
             return True
             
         except Exception as e:
-            logger.error(f"Error storing documents in vector store: {e}")
+            logger.error(f"Error storing documents: {e}")
             return False
     
     def search_similar(self, query: str, top_k: int = None) -> List[str]:
-        """Search for similar documents"""
-        top_k = top_k or processing_config.top_k_retrieval
+        """Enhanced search with multiple strategies"""
+        top_k = top_k or min(processing_config.top_k_retrieval * 2, 10)  # Increase search results
         
         try:
             # Embed the query
             query_embedding = self.embedder.embed_query(query)
             
-            # Search in vector store using v3+ API
+            # Primary search
             results = self.index.query(
                 vector=query_embedding,
                 top_k=top_k,
                 include_metadata=True
             )
             
-            # Extract text from results
             similar_texts = []
             matches = results.get("matches", [])
             
+            # Enhanced filtering and ranking
             for match in matches:
                 metadata = match.get("metadata", {})
                 text = metadata.get("text", "")
-                if text:
-                    similar_texts.append(text)
-                    
-                # Log similarity score for debugging
                 score = match.get("score", 0)
-                logger.debug(f"Found match with score {score:.3f}")
+                
+                if text and score > 0.6:  # Lower threshold for more results
+                    # Add section context if available
+                    section_type = metadata.get("section_type", "")
+                    if section_type and section_type != "general":
+                        text = f"[{section_type.upper()}] {text}"
+                    
+                    similar_texts.append(text)
+                    logger.debug(f"Found match (score: {score:.3f}, section: {section_type})")
+            
+            # If not enough results, do a second search with relaxed criteria
+            if len(similar_texts) < 3:
+                logger.info("Insufficient results, performing expanded search...")
+                expanded_results = self.index.query(
+                    vector=query_embedding,
+                    top_k=top_k * 2,
+                    include_metadata=True
+                )
+                
+                for match in expanded_results.get("matches", []):
+                    metadata = match.get("metadata", {})
+                    text = metadata.get("text", "")
+                    score = match.get("score", 0)
+                    
+                    if text and score > 0.4 and text not in similar_texts:  # Even lower threshold
+                        similar_texts.append(text)
+                        if len(similar_texts) >= 5:  # Cap at 5 results
+                            break
             
             logger.info(f"Found {len(similar_texts)} similar documents for query")
             return similar_texts
@@ -129,14 +158,10 @@ class VectorStore:
     def health_check(self) -> Dict[str, Any]:
         """Check vector store health"""
         try:
-            # Check if we can list indexes
             indexes = self.pc.list_indexes()
             index_names = indexes.names() if hasattr(indexes, 'names') else []
-            
-            # Check if our index exists
             index_exists = self.config.index_name in index_names
             
-            # If index exists, get stats
             index_stats = None
             if index_exists:
                 try:
@@ -155,8 +180,4 @@ class VectorStore:
             
         except Exception as e:
             logger.error(f"Vector store health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "pinecone_connected": False,
-                "error": str(e)
-            }
+            return {"status": "unhealthy", "pinecone_connected": False, "error": str(e)}
