@@ -13,6 +13,10 @@ import requests
 from urllib.parse import urlparse
 import multiprocessing
 
+# Configure logging FIRST
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 try:
     # Prefer pypdf; fallback to PyPDF2
     from pypdf import PdfReader, PdfWriter  # type: ignore
