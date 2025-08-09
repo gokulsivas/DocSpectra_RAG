@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 from urllib.parse import urlparse
 
-import PyPDF2
+from pypdf import PdfReader
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
@@ -137,7 +137,7 @@ class PDFProcessor:
             text_content = []
             
             with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = PdfReader(file)
                 
                 for page_num, page in enumerate(pdf_reader.pages):
                     try:
