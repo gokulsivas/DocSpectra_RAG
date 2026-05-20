@@ -14,7 +14,7 @@
 
 ---
 
-DocSpectra is a cloud-native Retrieval-Augmented Generation (RAG) pipeline that accepts a document URL, extracts and semantically chunks its content, stores embeddings in Pinecone, and answers natural-language questions using Amazon Titan via AWS Bedrock - entirely on AWS infrastructure.
+DocSpectra is a cloud-native Retrieval-Augmented Generation (RAG) pipeline that accepts a document URL, extracts and semantically chunks its content, stores embeddings in Pinecone, and answers natural-language questions using Amazon Titan via AWS Bedrock, entirely on AWS infrastructure.
 
 ---
 
